@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MyDSH 架构讲解 06 — Node.js / Electron / pnpm 技术栈扫盲</title>
+<style>
+  :root { --fg:#1f2328; --muted:#59636e; --border:#d1d9e0; --bg-soft:#f6f8fa; --code-bg:#f6f8fa; --accent:#0969da; --warn-bg:#fff8c5; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:32px 16px 64px; font-family:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif; font-size:15px; line-height:1.75; color:var(--fg); background:#fff; }
+  main { max-width:980px; margin:0 auto; }
+  h1 { font-size:1.9em; border-bottom:1px solid var(--border); padding-bottom:.35em; }
+  h2 { font-size:1.35em; border-bottom:1px solid var(--border); padding-bottom:.3em; margin-top:2.2em; }
+  h3 { font-size:1.12em; margin-top:1.7em; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  code { font-family:Consolas,"Courier New",monospace; font-size:.92em; background:var(--code-bg); border:1px solid var(--border); border-radius:4px; padding:.12em .35em; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:6px; padding:12px 14px; overflow-x:auto; line-height:1.55; }
+  pre code { background:none; border:none; padding:0; font-size:.88em; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:6px 12px; text-align:left; vertical-align:top; }
+  th { background:var(--bg-soft); }
+  blockquote { margin:1em 0; padding:.5em 1.1em; border-left:4px solid var(--accent); background:var(--bg-soft); }
+  .analogy { margin:1.2em 0; padding:.6em 1.1em; border-left:4px solid #bf8700; background:var(--warn-bg); border-radius:0 6px 6px 0; }
+  .analogy::before { content:"🐹 类比 · "; font-weight:700; color:#7d5900; }
+  ul,ol { padding-left:1.6em; } li { margin:.3em 0; }
+  .toc { background:var(--bg-soft); border:1px solid var(--border); border-radius:6px; padding:12px 20px; }
+  .toc ul { padding-left:1.2em; margin:.3em 0; }
+  footer { margin-top:3em; color:var(--muted); font-size:.9em; border-top:1px solid var(--border); padding-top:1em; }
+  .series { display:inline-block; background:var(--bg-soft); border:1px solid var(--border); border-radius:999px; padding:2px 12px; font-size:.88em; color:var(--muted); margin-bottom:1em; }
+</style>
+</head>
+<body>
+<main>
+
+<span class="series">MyDSH 架构讲解 · 第 06 篇 · <a href="index.html">返回索引</a></span>
+<h1>Node.js / Electron / pnpm 技术栈扫盲</h1>
+
+<p>本篇是"代码之外"的运行时扫盲：MyDSH 跑在什么技术上、这些技术跟你熟悉的 JVM/Android/Gradle 世界如何对应。全部概念配 Kotlin/Java/Dart 背景类比（🐹）。</p>
+
+<nav class="toc">
+<strong>目录</strong>
+<ul>
+  <li><a href="#node">一、Node.js：V8 出了浏览器沙箱</a></li>
+  <li><a href="#loop">二、libuv 事件循环的六个阶段</a></li>
+  <li><a href="#napi">三、N-API：Node 世界的 JNI</a></li>
+  <li><a href="#jit">四、执行模型与性能：V8 就是 Node 的 HotSpot</a></li>
+  <li><a href="#electron">五、Electron：带后端的定制浏览器</a></li>
+  <li><a href="#bridge">六、contextBridge：被远程网页打出来的安全边界</a></li>
+  <li><a href="#pnpm">七、pnpm：更快且省磁盘的 Maven</a></li>
+  <li><a href="#map">八、对照总表</a></li>
+</ul>
+</nav>
+
+<h2 id="node">一、Node.js：V8 出了浏览器沙箱</h2>
+
+<p><strong>Node.js = 把 Chrome 的 JS 引擎（V8）抠出来做成的通用程序运行时</strong>——一个 C++ 程序里嵌了 JS 虚拟机，再配一套能干实事的标准库（fs/net/http/child_process）。它<strong>不是浏览器</strong>：没有网页、没有 DOM。</p>
+
+<div class="analogy">
+Node 之于 JS = <strong>JVM 之于 Java</strong>。逐层对上：V8 ≈ HotSpot（JIT 执行引擎）；libuv ≈ 强制版 Netty EventLoop（异步 IO 运行时）；Node 内置模块 ≈ JDK；Node 发行版 ≈ JRE；npm/pnpm ≈ Maven/Gradle。
+</div>
+
+<p><strong>并发模型是与 JVM 最大的差别</strong>：JVM 的基本单位是线程（线程池随手开）；Node 的 JS 侧是<strong>单线程 + 事件循环</strong>——所有 IO 异步非阻塞（"发起读文件 → 注册回调 → 干别的 → libuv 通知完成"）。要多核才用 <code>worker_threads</code>（真线程，但靠消息传递，用起来像轻量进程）。</p>
+
+<div class="analogy">
+Node 事件循环 ≈ <strong>Netty 的 EventLoop</strong>：单线程跑所有回调，epoll 机制一个线程服务上万连接。JVM 把选择权给你（线程 or Netty 风格），Node 在语言层强制 Netty 风格。这也解释了本仓库全部 async/await 而无锁的原因——<strong>单线程事件循环里没有数据竞争</strong>，不需要 synchronized。
+</div>
+
+<p><strong>"系统级能力"从哪来？</strong>Node 二进制本身是 C++ 程序，每个能力（fs、net、child_process）都是编译进 node.exe 的 C++ 实现，经 V8 的 C++ 绑定层暴露给 JS。开发者不写 JNI，但 Node 内部处处是"JNI"——这套绑定机制的公开形式就是 N-API（见第三节）。所以"Node 掌握全系统权限"不是特权 API，而是<strong>浏览器里被沙箱拦住的绑定，在 Node 里天然向 JS 开放</strong>。</p>
+
+<h2 id="loop">二、libuv 事件循环的六个阶段</h2>
+
+<p>Node 主线程活着时循环以下六阶段，每阶段一个 FIFO 队列，跑完非空阶段进下一个：</p>
+
+<pre><code>┌─────────────────────────────────────────────────┐
+│ timers             setTimeout/setInterval 到期回调      │
+│ pending callbacks  上一轮延迟的系统操作回调（TCP 错误等） │
+│ idle, prepare      libuv 内部簿记                       │
+│ poll     ★核心：等 IO（epoll/IOCP）；有 timer 快到期时    │
+│          会算阻塞上限，避免睡过头                          │
+│ check              setImmediate 回调                    │
+│ close callbacks     关闭完成清理（socket.destroy 后通知）   │
+└─────────────────────────────────────────────────┘
+每轮结束检查活跃 handle/请求；全空闲且无待办 → 进程退出</code></pre>
+
+<p>实用结论：<strong><code>setImmediate</code>（check 阶段，本轮 IO 后）先于 <code>setTimeout(0)</code>（timers 阶段，下轮才轮到）</strong>。微任务（Promise）不在这六阶段里，在每个宏任务之间插队执行。</p>
+
+<div class="analogy">poll 阶段 = Netty 的 <code>selector.select(timeout)</code>，timeout 由最近 timer 算出——完全同构，只是 Node 把"runAllTasks + select"细化成了六个有名有姓的队列。</div>
+
+<h2 id="napi">三、N-API：Node 世界的 JNI</h2>
+
+<p>从 JS 调 C/C++ 代码的机制，流程是 Java JNI 的翻版：</p>
+
+<pre><code>写 C++ 源码（用 N-API 稳定 C ABI 头文件）
+  ↓ node-gyp 构建工具（读 binding.gyp 配置 —— ≈ 精简版 CMake）
+  ↓ 调平台编译器（Windows: MSVC / Linux: gcc）
+  ↓ 产出 .node 文件（本质 = 改了扩展名的 DLL / .so）
+  ↓ JS 里 require('xxx.node') → V8 注册成 JS 可调对象</code></pre>
+
+<p>关键演进：早期 API（NAN）跟着 V8 版本变，每升 Node 全部 addon 重新编译；<strong>N-API 承诺 C ABI 永久稳定</strong>——编译一次，任何后续 Node 版本都能加载，addon 生态才立住。现代分发用 prebuildify/node-pre-gyp <strong>预编译各平台二进制随包发布</strong>，用户免本地编译（Windows 没装 MSVC 也能装）。</p>
+
+<div class="analogy">
+binding.gyp ≈ CMakeLists；N-API ≈ JNI 的稳定 ABI 化（比 JNI 做得好的地方：Java 每 JDK 大版 JNI 行为也会抖）。MyDSH 仓库 <code>native/</code> 的 <code>@deepseek-ai/node-addon-system</code> 就是这么编的；Electron 比纯 Node 多出的窗口/托盘/菜单能力，本质也是一批内置 addon。
+</div>
+
+<h2 id="jit">四、执行模型与性能：V8 就是 Node 的 HotSpot</h2>
+
+<p><strong>不是"类 JIT 的解释执行"——就是真 JIT</strong>，且 V8 是工业界最强 JIT 之一。分层执行（与 HotSpot 同源思想）：</p>
+
+<pre><code>Ignition   解释器：字节码逐条解释 —— 冷代码，启动快
+Sparkplug  基线 JIT：快速出未优化机器码
+Maglev     中阶 JIT：较激进优化
+TurboFan   顶层 JIT：类型反馈 + 推测优化 → 高质量机器码
+           热函数逐级"加热"上升；推测失败（类型变了）→ 去优化回退</pre></code>
+
+<p>性能的真实图景：</p>
+<table>
+  <tr><th>场景</th><th>vs 原生（C++/Rust）</th></tr>
+  <tr><td>纯数值计算、序列化热循环</td><td>慢 2~10 倍（Deopt、GC、隐藏类等差距真实存在）</td></tr>
+  <tr><td><strong>IO 密集</strong>（网络服务、agent 负载）</td><td><strong>几乎无差</strong>：瓶颈在网络/磁盘等待，JS 只做编排；事件循环吞吐常胜 JVM 线程池（免线程切换）</td></tr>
+  <tr><td>真有 CPU 热点</td><td>下沉 C++ addon 兜底（VS Code / 本仓库 native addon 的做法）</td></tr>
+</table>
+
+<p><strong>agent harness 恰好是 IO 密集的极端形态</strong>：一次对话 = 等模型流（秒级）→ 等工具进程 → 等磁盘，V8 只做"调度和拼 JSON"。这也是 TS 生态能撑起 VS Code/Cursor 这类大型软件的原因：性能瓶颈都不在 JS 执行层。</p>
+
+<h2 id="electron">五、Electron：带后端的定制浏览器</h2>
+
+<p><strong>Electron = 把 Chromium + Node.js 打包成一个可执行程序框架</strong>。你直觉里的"超级 webview"是对的——但带了一个全权限后端。与浏览器同为 Chromium 技术但模型不同：</p>
+
+<pre><code>┌─ 主进程 (Main) ──────────────────────┐
+│  Node.js 全系统权限                     │
+│  MyDSH: apps/desktop/src/main.ts        │
+│  管：窗口生命周期、菜单、协议、托盘、更新    │
+└──────────┬───────────────────────────┘
+           │ IPC（JSON 消息进程间通信）
+┌─ 渲染进程 (Renderer) ────────────────┐
+│  Chromium 沙箱 = "浏览器标签页"           │
+│  加载 apps/web 的 React 产物             │
+│  无 fs/进程权限，干活必须 IPC            │
+└─────────────────────────────────────┘</code></pre>
+
+<p>MyDSH 在标准模型上再加一层成<strong>三层</strong>：渲染（React UI）+ 主进程（窗口/更新/单实例）+ <strong>Host 进程</strong>（主进程以 <code>ELECTRON_RUN_AS_NODE=1</code> 拉起的纯 Node 子进程，跑整个 Cordis 插件树、开本地 HTTP server）。UI 不含业务逻辑，全靠认证 RPC 连 Host。</p>
+
+<div class="analogy">
+双进程模型 = <strong>Android 双进程</strong>（前台 UI + 后台 Service 经 Binder）= <strong>Flutter Platform Channel</strong>（UI 进程不直接碰系统 API）。Electron 主进程 ≈ Application/Service 层，renderer ≈ Activity 层。入口查找规则：Electron 读 package.json 的 <code>"main"</code>；CLI 读 <code>"bin"</code>；<strong>src/index.ts 只是包的库导出面（facade），不是程序入口</strong>——找入口看 package.json，找包的 API 看 src/index.ts。
+</div>
+
+<h2 id="bridge">六、contextBridge：被远程网页打出来的安全边界</h2>
+
+<p>历史教训：早期 Electron 应用图省事开 <code>nodeIntegration: true</code>——渲染进程（跑不可信内容的层）拥有全套 Node 权限。应用加载任何带 XSS 的页面，攻击者注入的 JS 就能 <code>require('child_process')</code> 格式化硬盘。2016 年前后一批知名应用真实中招。</p>
+
+<p>contextBridge 是架构级亡羊补牢，原则 <strong>权限进不了不可信环境</strong>：</p>
+
+<ul>
+  <li>renderer 开 sandbox（纯 Chromium，0 Node 权限）</li>
+  <li>preload 脚本 = 有 Node 权限的唯一小岛</li>
+  <li><code>contextBridge.exposeInMainWorld('api', {...})</code> 把精选的几个函数以<strong>纯函数桥</strong>挂给网页世界：参数/返回值结构化克隆，函数引用、原型链污染全过不了桥</li>
+</ul>
+
+<div class="analogy">
+= Android 的分层：<strong>网页 = App 层（无特权），preload = Binder 桥接层（白名单方法表），主进程 = System Service 层</strong>。MyDSH 更极端——渲染进程只连 Host 的 RPC server，主进程仅做窗口管理，业务面最小暴露。
+</div>
+
+<h2 id="pnpm">七、pnpm：更快且省磁盘的 Maven</h2>
+
+<p><strong>pnpm = performant npm</strong>，Node 的包管理器（npm 生态 ≈ Maven 仓库生态）。npm 包没有编译环节，包管理器的职责就是"解析版本依赖图 → 下载 → 摆成可 import 的目录"。</p>
+
+<p>npm 的历史包袱：每项目独立 node_modules 副本（磁盘爆炸）+ 依赖拍平（幽灵依赖——用了没声明的包也能跑，换个环境就崩）。pnpm 三板斧：</p>
+
+<ol>
+  <li><strong>内容寻址全局 store</strong>：所有包全机只存一份，按内容 hash 索引；安装 = 硬链接（同一文件磁盘只有一个物理副本）</li>
+  <li><strong>严格隔离</strong>：node_modules 用 symlink 树，<strong>只能 import 声明过的依赖</strong>，杜绝幽灵依赖</li>
+  <li><strong>原生 workspace</strong>：根 <code>pnpm-workspace.yaml</code> 声明 monorepo 成员，成员间依赖写 <code>"@deepseek-ai/dsh-session": "workspace:*"</code> 直接 symlink 到本地目录，发布时才替换为真实版本</li>
+</ol>
+
+<div class="analogy">
+全局 store = <strong>Maven 的 <code>~/.m2/repository</code></strong>（Maven 用户秒懂），只是 pnpm 多用硬链接让项目目录看起来仍完整；<code>workspace:*</code> ≈ <code>implementation(project(":dsh-session"))</code>；pnpm-lock.yaml ≈ 版本锁定文件；<strong>package.json 的 scripts 段就是 Node 生态的构建系统</strong>（没有 Makefile/Gradle wrapper 概念）。
+</div>
+
+<p>本仓库常用命令：</p>
+
+<pre><code>pnpm install                  # 装全部工作区依赖（= mvn install 的大头，一次即可）
+pnpm run build                # 构建全部包
+pnpm --dir apps/desktop run package:win:x64:unsigned   # 在指定包目录跑脚本
+pnpm dsh --profile web "任务"  # 跑根 package.json 定义的 dsh script
+pnpm why &lt;包名&gt;               # = mvn dependency:tree</code></pre>
+
+<p>与内网环境的关系：pnpm 默认只认 HTTPS registry，我们改了 <code>desktop-release-environment.mjs</code> 接受公司 HTTP 私服；下载走 Node fetch 需信任 MITM 证书（<code>NODE_EXTRA_CA_CERTS</code>）——打包时的全套环境变量就是伺候这条链路。</p>
+
+<h2 id="map">八、对照总表</h2>
+
+<table>
+  <tr><th>Node 生态</th><th>你熟悉的对应物</th></tr>
+  <tr><td>V8 JIT</td><td>HotSpot VM（分层编译：Ignition→Sparkplug→Maglev→TurboFan ≈ C1/C2）</td></tr>
+  <tr><td>libuv 事件循环</td><td>Netty EventLoop（单线程回调 + epoll）</td></tr>
+  <tr><td>worker_threads</td><td>真线程，但消息传递模型（≈ 轻量进程）</td></tr>
+  <tr><td>N-API addon</td><td>JNI + node-gyp ≈ CMake</td></tr>
+  <tr><td>package.json scripts</td><td>构建系统（Makefile/Gradle tasks 生态位）</td></tr>
+  <tr><td>pnpm</td><td>Maven（全局仓库 + 版本锁定 + 多模块）</td></tr>
+  <tr><td>workspace:*</td><td>implementation(project(":x"))</td></tr>
+  <tr><td>Electron 双进程</td><td>Android 双进程 / Flutter Platform Channel</td></tr>
+  <tr><td>contextBridge</td><td>Binder 桥接 + 白名单方法表</td></tr>
+  <tr><td>src/index.ts</td><td>包的 facade（≠ 程序入口；入口看 bin/main）</td></tr>
+</table>
+
+<footer>
+MyDSH 架构讲解系列 · 第 06 篇 · <a href="index.html">返回索引</a> · 主题：运行时技术栈扫盲 · 源码关联：apps/desktop/src/main.ts、apps/desktop-host、native/
+</footer>
+
+</main>
+</body>
+</html>
