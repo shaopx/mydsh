@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MyDSH 架构详解 01 — 整体架构与核心概念</title>
+<style>
+  :root {
+    --fg: #1f2328; --muted: #59636e; --border: #d1d9e0; --bg-soft: #f6f8fa;
+    --code-bg: #f6f8fa; --accent: #0969da; --warn-bg: #fff8c5; --warn-border: #d4a72c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 32px 16px 64px; font-family: -apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif; font-size: 15px; line-height: 1.75; color: var(--fg); background: #fff; }
+  main { max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 1.9em; border-bottom: 1px solid var(--border); padding-bottom: .35em; }
+  h2 { font-size: 1.35em; border-bottom: 1px solid var(--border); padding-bottom: .3em; margin-top: 2.2em; }
+  h3 { font-size: 1.12em; margin-top: 1.7em; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: Consolas,"Courier New",monospace; font-size: .92em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; padding: .12em .35em; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; overflow-x: auto; line-height: 1.55; }
+  pre code { background: none; border: none; padding: 0; font-size: .88em; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; display: block; overflow-x: auto; }
+  th, td { border: 1px solid var(--border); padding: 6px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--bg-soft); }
+  blockquote { margin: 1em 0; padding: .5em 1.1em; border-left: 4px solid var(--accent); background: var(--bg-soft); }
+  .analogy { margin: 1.2em 0; padding: .6em 1.1em; border-left: 4px solid #bf8700; background: var(--warn-bg); border-radius: 0 6px 6px 0; }
+  .analogy::before { content: "🐹 类比 · "; font-weight: 700; color: #7d5900; }
+  ul, ol { padding-left: 1.6em; }
+  li { margin: .3em 0; }
+  .toc { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 6px; padding: 12px 20px; }
+  .toc ul { padding-left: 1.2em; margin: .3em 0; }
+  footer { margin-top: 3em; color: var(--muted); font-size: .9em; border-top: 1px solid var(--border); padding-top: 1em; }
+  .series { display: inline-block; background: var(--bg-soft); border: 1px solid var(--border); border-radius: 999px; padding: 2px 12px; font-size: .88em; color: var(--muted); margin-bottom: 1em; }
+</style>
+</head>
+<body>
+<main>
+
+<span class="series">MyDSH 架构讲解 · 第 01 篇（本目录将陆续添加更多讲解文档）</span>
+<h1>整体架构与核心概念</h1>
+
+<p>本文基于仓库权威文档（<code>docs/architecture.md</code>、<code>docs/cordis-primer.md</code>）与源码研究整理，面向有 <strong>Kotlin / Java / Dart</strong> 开发经验的读者。每遇到框架新概念，都会给出你熟悉的技术栈中的对应物。</p>
+
+<nav class="toc">
+  <strong>目录</strong>
+  <ul>
+    <li><a href="#s0">0. 一句话定位</a></li>
+    <li><a href="#s1">1. 分层结构：代码的物理布局</a></li>
+    <li><a href="#s2">2. Cordis 微内核：三个核心概念</a></li>
+    <li><a href="#s3">3. 组合机制：profile → bundle → patch</a></li>
+    <li><a href="#s4">4. 核心引擎：一次对话的完整生命周期</a></li>
+    <li><a href="#s5">5. 核心包一览</a></li>
+    <li><a href="#s6">6. Desktop 启动链路</a></li>
+    <li><a href="#s7">7. 我们的定制在架构中的位置</a></li>
+    <li><a href="#s8">8. 深入阅读路线</a></li>
+  </ul>
+</nav>
+
+<h2 id="s0">0. 一句话定位</h2>
+
+<p><strong>MyDSH（DeepSeek Harness 的 fork）是一个"一切皆插件"的 AI 编程助手宿主（harness）</strong>：微内核 Cordis 只提供插件容器，模型适配、工具执行、会话存储、agent 循环本身——全部是可替换的插件，从 YAML 配置组装。</p>
+
+<div class="analogy">
+<strong>宿主（harness）</strong>之于 agent，就像 <strong>Android 系统之于 App</strong>：agent 的"智能"来自大模型，但要干活（读写文件、执行命令、联网搜索）需要一整套运行环境——这就是 harness 提供的：工具注册、权限审批、会话持久化、上下文管理。Kotlin 里最接近的类比是你写一个 Ktor <strong>Application</strong>：框架（引擎）只负责生命周期和管道，业务全靠 <code>install()</code> 进去的插件。
+</div>
+
+<h2 id="s1">1. 分层结构：代码的物理布局</h2>
+
+<pre><code>vendor/          Cordis 微内核（~8k 行 TS，源码内置而非 npm 依赖）
+packages/        70+ 个 dsh-* 插件包，按领域分组
+  core/            会话、agent 循环、工具注册表、系统提示组装   ← 引擎
+  llm/             模型提供商适配器（llm-pi-ai、llm-deepseek…）
+  shell/ terminal/ subprocess/ ssh/   命令执行域
+  session/ deliverables/ spill/        持久化域
+  browser-use/ computer-use/ web/    交互域
+  client/          React UI 包群（ui-layout、ui-sidebar、locale…）
+  api/             远程 BFF
+  boot/            应用启动（profile 解析、HMR）
+  util/            零依赖基础件（home-paths 就在这）
+apps/
+  web/             Vite 构建的浏览器端（Electron 也加载它）
+  desktop/         Electron 桌面壳</code></pre>
+
+<div class="analogy">
+这个布局相当于 <strong>Kotlin 多模块 Gradle 工程</strong>：<code>vendor/</code> 是你 fork 进来自己维护的第三方库（类似把 OkHttp 源码 vendor 进仓库以获得可审计、可打补丁的掌控力）；<code>packages/*</code> 是 70 多个 feature module；<code>apps/*</code> 是最终的可执行应用模块。DSH 用 <strong>pnpm workspace</strong> 组织，等价于 Gradle 的多项目构建 + <code>implementation(project(":xxx"))</code>。
+</div>
+
+<h2 id="s2">2. Cordis 微内核：三个核心概念</h2>
+
+<h3>① ctx（Context）—— 服务定位器 + 生命周期宿主</h3>
+
+<p>每个插件启动时拿到一个 <code>ctx</code> 对象，它是所有服务的入口。服务通过<strong>类型化 key</strong>注册和查找：</p>
+
+<pre><code>// 插件 = 一个函数，接收 ctx，声明式列出依赖
+const MyPlugin = definePlugin((ctx) => {
+  // 注册是可逆 effect：插件卸载时自动撤销
+  ctx.effect(() => () => console.log('cleaned up'))
+  // 订阅事件也是 effect
+  ctx.on('session/event', (event) => { ... })
+})</code></pre>
+
+<div class="analogy">
+<code>ctx</code> ≈ <strong>Android 的 Context</strong> + <strong>Hilt/Koin 的 DI 容器</strong>的合体：既能 <code>ctx.get(SomeService)</code> 找服务（Koin: <code>get&lt;SomeService&gt;()</code>），又携带生命周期（Android Context 的 <code>registerReceiver</code> 要配对 <code>unregisterReceiver</code>——而 Cordis 把"配对"自动化了，见下一条）。Dart 里的对应物是 <strong>Flutter 的 Widget 树 + InheritedWidget</strong>：Element 也是"挂载即获得环境、卸载即自动清理"。
+</div>
+
+<h3>② 可逆 effect —— 自动化的资源所有权</h3>
+
+<p><code>ctx.effect()</code> 注册的清理函数在插件卸载时<strong>按注册逆序</strong>执行。这是 <code>vendor/cordis/src/fiber.ts</code>（778 行）的全部职责：维护"谁拥有哪些待清理资源"的所有权树。<strong>没有特权核心</strong>——官方文档原话："你通过在其他插件旁边挂载一个插件来扩展 dsh"。</p>
+
+<div class="analogy">
+这就是 <strong>Kotlin 协程的结构化并发</strong>：你在 <code>CoroutineScope</code> 里 <code>launch</code> 的任何子协程，在 scope <code>cancel()</code> 时自动向下传播取消——你从不需要手动记住"我启动过的每个线程都要 join"。Cordis 的 effect 同构：插件作用域内注册的每个清理动作，随插件卸载自动逆序执行。Java 程序员熟悉的痛点（try-with-resources 只管单个资源、listener 泄漏）在这里被语言级的所有权模型消解。JVM 上最接近的思想是 <strong>Reactor/RxJava 的 Disposable 链</strong>（<code>Disposables.composite()</code>），但 Cordis 把它做成了默认而非纪律。
+</div>
+
+<h3>③ typed events —— 编译期检查的事件总线</h3>
+
+<p>通过 TypeScript 的 <code>declare module</code> 声明合并，任何插件都能给全局事件表添加<strong>类型化</strong>事件键，全进程静态可查。</p>
+
+<div class="analogy">
+相当于给 <strong>EventBus（greenrobot/EventBus 或 Kotlin SharedFlow）的每条消息都写了 sealed class</strong>：发布 <code>ctx.emit('agent/step', payload)</code> 时，payload 类型、监听者签名全部编译期校验，而事件表本身可以被任意插件扩展（不需要修改总线源码）。Dart 程序员可以想象"每个插件都能向 <code>StreamControllers</code> 注册表添加新的强类型 Stream"。
+</div>
+
+<h2 id="s3">3. 组合机制：profile → bundle → patch</h2>
+
+<p>这是"配置即架构"的关键。<strong>一个运行中的 MyDSH = 一棵插件树</strong>，由有序层叠出：</p>
+
+<pre><code>空的插件行列表
+  + profile 声明的 bundles（有序）              ← 发布层的默认配置
+  + ~/.mydsh/profiles/&lt;name&gt;/cordis.patch.yml   ← 用户层
+  + --patch 命令行 overlay                      ← 临时层</code></pre>
+
+<ul>
+  <li><strong>profile</strong>：命名组合，<code>web</code> / <code>headless</code> / <code>sdk</code> / <code>desktop</code>（Electron 专用）</li>
+  <li><strong>bundle</strong>：插件的分发格式。<code>dsh-base</code> 是公共底层（模型适配+工具+持久化+沙箱+凭证），<code>dsh-web-app</code> 在其上加浏览器应用</li>
+  <li><strong>patch</strong>：按 id 定位一行插件，整个替换其 config，或插入新行</li>
+</ul>
+
+<div class="analogy">
+三层叠加 = <strong>Gradle 多项目构建的配置覆盖链</strong>：根 <code>build.gradle.kts</code> 定公共配置（bundle），子模块覆盖（profile），命令行 <code>-Pproperty</code> 临时覆盖（overlay）。也可以类比为 <strong>Spring Boot 的配置优先级</strong>：打包默认 < application.yml < 环境变量。DSH 的独特之处在于被"配置"的不是属性而是<strong>整个插件的挂载与卸载</strong>——我们把 <code>llm-deepseek</code> 的行 patch 成 <code>disabled: true</code>，等于在 Spring 里用 profile 条件性地 <code>@ConditionalOnProperty</code> 排除掉一个 auto-configuration。
+</div>
+
+<p>我们的 LLM 配置正是利用这一点：在 <code>~/.mydsh/profiles/desktop/cordis.patch.yml</code> 里 patch 掉 llm-deepseek、给 llm-pi-ai 注入 qwen-maas 网关 provider、覆盖默认模型——<strong>对上游代码零修改，纯配置层完成</strong>。验证工具：<code>dsh --profile web --dump-config</code> 可打印最终组合树。</p>
+
+<h2 id="s4">4. 核心引擎：一次对话的完整生命周期</h2>
+
+<p>先明确两个单位：</p>
+
+<ul>
+  <li><strong>step（步骤）</strong> = 一次模型请求 + 它调用的工具</li>
+  <li><strong>turn（轮次）</strong> = 零或多步：从用户输入被认领开始，到"不再欠任何东西"结束</li>
+</ul>
+
+<pre><code>turn/start
+  认领输入 + 组装提示词（快照模型选择、注入工具 schema）
+  → agent/pre-step（瀑布：监听者可改写/拒绝消息）
+  step/start
+    agent/request → 准备调用 → 绑定适配器
+    追加用户消息到会话日志 → 从日志冻结出模型历史
+    流式调用 → llm/stream → agent/assistant-stream
+      chunk*（增量）→ assistant/message（落日志）
+    tool/call* → tools/pre-execute → 执行 → post-execute → tool/result*
+  step/end
+  工具还欠请求 或 新输入到达 → 下一个 step
+turn/end</code></pre>
+
+<div class="analogy">
+step/turn 的关系 = <strong>协程与 Job 的父子关系</strong>：一个 turn 是一次用户交互的完整 Job，其中的每个 step（模型请求+工具执行）是顺序执行的子任务。而"工具还欠请求 → 下一个 step"就是 agent 的核心循环：模型回复"我需要先读这个文件"，工具执行后把结果喂回去，再来一次模型请求——直到模型不再要工具，turn 结束。
+</div>
+
+<h3>三个关键设计原则</h3>
+
+<p><strong>(1) 日志即真相（Model-visible ⟺ logged）。</strong>发给模型的所有东西（<code>system/message</code>、<code>user/message</code>、<code>assistant/message</code>、<code>tool/*</code>）都是持久会话事件，落盘到 <code>session.v4.jsonl.zstd</code>。模型历史不是内存状态，是<strong>每次从日志推导并冻结</strong>的。</p>
+
+<div class="analogy">
+这是 <strong>Event Sourcing</strong>（事件溯源）架构：像 Kafka 的 log 或 jetbrains 用来做 IDE 撤销的命令栈——当前状态 = fold(全部历史事件)。好处：崩溃后重放日志即恢复现场；审计、回放、分支（fork 会话）都天然免费。Dart/Flutter 程序员最熟悉的同类设计是 <strong>Redux 的单一 Store + action log</strong>，或 Flutter DevTools 的 timeline 事件流。
+</div>
+
+<p><strong>(2) waterfall 事件（瀑布式拦截点）。</strong><code>agent/pre-step</code>、<code>llm/stream</code>、<code>tools/*</code> 是瀑布：监听者<strong>必须调 <code>next()</code></strong> 否则整条链短路。守卫、审批策略、遥测都挂在这里，不需要修改循环本身。</p>
+
+<div class="analogy">
+就是 <strong>OkHttp Interceptor 链</strong>或 <strong>Ktor 的 <code>intercept</code> 管线</strong>：每个拦截者可以改写请求/响应、可以直接短路返回（拒绝执行），也可以 <code>proceed()</code>（这里的 <code>next()</code>）放行给下一个。仓库规则"waterfall 监听者必须调用 next()"对应 OkHttp 拦截器忘记 <code>chain.proceed</code> 的话调用链就断了——只是这里靠文档约定而非编译器。
+</div>
+
+<p><strong>(3) 流式与提交分离。</strong><code>agent/assistant-stream</code> 的 chunk 是进程内瞬态，只有完整消息才提交为持久事件——崩溃恢复时丢的只是未完成的流，日志永远一致。</p>
+
+<div class="analogy">
+等于 <strong>数据库事务</strong>的影子：流式 token 像 redo log 的增量写入，但只有事务提交（assistant/message 落日志）后才对外可见/可恢复。UI 拿到的打字机效果是"未提交数据的前端预览"。
+</div>
+
+<h2 id="s5">5. 核心包一览</h2>
+
+<table>
+  <tr><th>包</th><th>职责</th><th>ctx key</th></tr>
+  <tr><td><code>core/session</code></td><td>追加式 SessionEvent 日志 + 内存 store</td><td><code>ctx.sessions</code></td></tr>
+  <tr><td><code>core/system-prompt</code></td><td>提示词分节组装</td><td><code>ctx.systemPrompt</code></td></tr>
+  <tr><td><code>core/tools</code></td><td>作用域工具注册表 + 带守卫的执行管线</td><td><code>ctx.tools</code></td></tr>
+  <tr><td><code>core/agent</code></td><td>Agent 接口 + 活动注册表 + <code>agent/*</code> 事件</td><td><code>ctx.agents</code></td></tr>
+  <tr><td><code>core/agent-loop</code></td><td>默认驱动器（上面流程图的实现）</td><td><code>ctx.agentLoop</code></td></tr>
+  <tr><td><code>llm/llm</code></td><td>消息/流词汇表 + 适配器接缝</td><td><code>ctx.llm</code></td></tr>
+</table>
+
+<p>注意：<strong>agent-loop 自己也只是插件</strong>——理论上可以整环替换驱动器。文档明确"改 agent-loop 需要更新 architecture.md"，它是唯一接近"特权"的东西。</p>
+
+<div class="analogy">
+ctx key ≈ <strong>Hilt 的限定符注解</strong>（Qualifier）或 Koin 的 <code>single { ... }</code> 绑定键：服务注册时绑定一个类型化 key，消费者按 key 注入。区别在于 Cordis 的注册天然<strong>随插件生命周期可逆</strong>——插件卸载，它注册的服务/事件/工具全部消失，不留悬空引用。
+</div>
+
+<h2 id="s6">6. Desktop 启动链路</h2>
+
+<pre><code>MyDSH.exe (Electron)
+  └ main.ts → 启动 Desktop Host（Electron Node 模式）
+      └ node-environment.ts ←【我们改的】读 ~/.mydsh/network.json，
+        为子进程注入 代理/CA 环境变量（文件不存在 = 零注入）
+      └ 调用共享 CLI profile runner：dsh --profile desktop
+          └ 组合插件树（dsh-base + dsh-web-app + ~/.mydsh patch）
+              └ api server 监听 OS 随机端口
+  └ 窗口加载打包好的 Web 资产（apps/web 的产物）
+      └ client 插件在同一 document 激活
+      └ 通过 RPC/流连接本机 Host（认证 token）</code></pre>
+
+<p><strong>双平面结构</strong>：Host（Node 进程）跑全部 agent/工具/会话；渲染进程只跑 React UI。UI 不直接碰系统，一切经 RPC——这也是 Web 版和桌面版能共享 95% 代码的原因。</p>
+
+<div class="analogy">
+和 <strong>Flutter 的架构分工</strong>一模一样：Flutter Framework（UI）通过 Platform Channel 与宿主平台（能力）通信，UI 进程不直接碰系统 API。也像 Android 的<strong>双进程模型</strong>：前台 UI + 后台 Service 通过 Binder 通信。Electron 的 main 进程 ≈ Android 的 Application/Service 层，renderer ≈ Activity 层。
+</div>
+
+<h2 id="s7">7. 我们的定制在架构中的位置</h2>
+
+<table>
+  <tr><th>改动</th><th>架构层次</th><th>为什么这个位置是对的</th></tr>
+  <tr><td><code>DSH_HOME_DIR_NAME='.mydsh'</code></td><td>util（基础件）</td><td>所有路径推导的根，一处改全局生效（profile、会话、凭证全在 ~/.mydsh 下）</td></tr>
+  <tr><td><code>network.json</code> 注入</td><td>Electron Host 启动</td><td>在所有子进程诞生之前注入环境，覆盖整棵插件树的网络行为；配置驱动 = 不影响直连环境</td></tr>
+  <tr><td><code>productName: MyDSH</code></td><td>打包配置</td><td>Electron userData/单实例锁/安装目录都由它派生——解决了与官方版互斥问题</td></tr>
+  <tr><td>LLM patch（qwen-maas）</td><td><strong>配置层</strong>（非代码）</td><td>Cordis 的 patch 机制本来就是为此设计的；llm-pi-ai 是 OpenAI 兼容适配器，声明一个 provider 即接入</td></tr>
+  <tr><td><code>mitm-ca.pem</code></td><td>extraResources</td><td>跟着安装包走，network.json 用 <code>"packaged"</code> 引用</td></tr>
+  <tr><td>品牌文案</td><td>locale 包 + web 标题</td><td><code>brand.localBuild</code> 键是 UI 显示产品名的单一出口</td></tr>
+</table>
+
+<h2 id="s8">8. 深入阅读路线</h2>
+
+<ol>
+  <li><code>docs/cordis-primer.md</code> — 框架语义（waterfall、effect）</li>
+  <li><code>packages/core/agent-loop/README.md</code>（"understand the implementation"节）— 循环实现的权威细节</li>
+  <li><code>packages/bundle/base/cordis.patch.yml</code> — 看一棵真实的插件树长什么样</li>
+  <li><code>dsh --profile web --dump-config</code> — 看你自己机器上实际组合出的树</li>
+</ol>
+
+<footer>
+MyDSH 架构讲解系列 · 第 01 篇 · 本目录（<code>mydocs/architecture/</code>）为个人定制文档，与上游 <code>docs/</code> 相互独立。
+</footer>
+
+</main>
+</body>
+</html>
