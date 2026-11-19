@@ -47,12 +47,11 @@ export function resolveNpmRegistry(env) {
   if (configured === '') return DEFAULT_NPM_REGISTRY
   let url
   try { url = new URL(configured) }
-  catch { throw new Error(`desktop release environment: ${NPM_REGISTRY_ENV} must be an HTTPS origin`) }
-  if (url.protocol !== 'https:' || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== ''
-    || (url.pathname !== '/' && url.pathname !== '')) {
-    throw new Error(`desktop release environment: ${NPM_REGISTRY_ENV} must be an HTTPS origin without credentials, path, query, or fragment`)
+  catch { throw new Error(`desktop release environment: ${NPM_REGISTRY_ENV} must be an HTTP(S) origin`) }
+  if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '') {
+    throw new Error(`desktop release environment: ${NPM_REGISTRY_ENV} must be an HTTP(S) origin without credentials, query, or fragment`)
   }
-  return url.origin
+  return url.origin + (url.pathname === '/' ? '' : url.pathname)
 }
 
 /**
