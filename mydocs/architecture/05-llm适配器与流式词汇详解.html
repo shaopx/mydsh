@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MyDSH 架构详解 05 — llm：适配器注册表与流式调用词汇</title>
+<style>
+  :root { --fg:#1f2328; --muted:#59636e; --border:#d1d9e0; --bg-soft:#f6f8fa; --code-bg:#f6f8fa; --accent:#0969da; --warn-bg:#fff8c5; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:32px 16px 64px; font-family:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif; font-size:15px; line-height:1.75; color:var(--fg); background:#fff; }
+  main { max-width:980px; margin:0 auto; }
+  h1 { font-size:1.9em; border-bottom:1px solid var(--border); padding-bottom:.35em; }
+  h2 { font-size:1.35em; border-bottom:1px solid var(--border); padding-bottom:.3em; margin-top:2.2em; }
+  h3 { font-size:1.12em; margin-top:1.7em; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  code { font-family:Consolas,"Courier New",monospace; font-size:.92em; background:var(--code-bg); border:1px solid var(--border); border-radius:4px; padding:.12em .35em; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:6px; padding:12px 14px; overflow-x:auto; line-height:1.55; }
+  pre code { background:none; border:none; padding:0; font-size:.88em; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:6px 12px; text-align:left; vertical-align:top; }
+  th { background:var(--bg-soft); }
+  blockquote { margin:1em 0; padding:.5em 1.1em; border-left:4px solid var(--accent); background:var(--bg-soft); }
+  .analogy { margin:1.2em 0; padding:.6em 1.1em; border-left:4px solid #bf8700; background:var(--warn-bg); border-radius:0 6px 6px 0; }
+  .analogy::before { content:"🐹 类比 · "; font-weight:700; color:#7d5900; }
+  ul,ol { padding-left:1.6em; } li { margin:.3em 0; }
+  .toc { background:var(--bg-soft); border:1px solid var(--border); border-radius:6px; padding:12px 20px; }
+  .toc ul { padding-left:1.2em; margin:.3em 0; }
+  footer { margin-top:3em; color:var(--muted); font-size:.9em; border-top:1px solid var(--border); padding-top:1em; }
+  .series { display:inline-block; background:var(--bg-soft); border:1px solid var(--border); border-radius:999px; padding:2px 12px; font-size:.88em; color:var(--muted); margin-bottom:1em; }
+  .filecard { border:1px solid var(--border); border-radius:8px; padding:10px 16px; margin:1em 0; background:var(--bg-soft); }
+  .filecard .path { font-family:Consolas,monospace; font-weight:700; color:#0550ae; }
+  .filecard .lines { float:right; color:var(--muted); font-size:.88em; }
+</style>
+</head>
+<body>
+<main>
+
+<span class="series">MyDSH 架构讲解 · 第 05 篇 · <a href="index.html">返回索引</a></span>
+<h1>llm：适配器注册表与流式调用词汇</h1>
+
+<p><code>packages/llm/llm</code>（4086 行、12 个文件）是<strong>模型调用的中立词汇层</strong>：消息与内容块的规范类型、流式 chunk 词汇、适配器注册表、以及一个 waterfall 可拦截的流式调用 API。我们配置的 qwen-maas 网关（llm-pi-ai 插件声明 openai-completions provider）最终就落到这里被调用。</p>
+
+<nav class="toc">
+<strong>目录</strong>
+<ul>
+  <li><a href="#registry">一、LlmRuntime 与适配器注册表（index.ts）</a></li>
+  <li><a href="#prepared">二、prepareCall：一次绑定的调用</a></li>
+  <li><a href="#vocab">三、词汇文件：types / message / content / brand</a></li>
+  <li><a href="#stream">四、流文件：assembler / assistant-stream / adapter-failure</a></li>
+  <li><a href="#rest">五、其余文件</a></li>
+  <li><a href="#summary">六、本篇要点 + 系列回顾</a></li>
+</ul>
+</nav>
+
+<h2 id="registry">一、LlmRuntime 与适配器注册表（index.ts，1204 行）</h2>
+
+<h3>LlmAdapter：抽象基类，唯一必须实现的是 stream</h3>
+<pre><code>export abstract class LlmAdapter {
+  providerInfo(provider)            // 显示元数据（默认 id=名字）
+  providerRetryPolicy(provider)     // 该路由的重试策略
+  imageRequestPricing(...)          // 图像计价（token 表用）
+  listModels(provider)              // 可发现模型目录（GUI 用）
+  resolveModel(provider, model)     // 单模型元数据
+  prepareCall(provider, model)      // 绑定"一代"适配器的调用（默认=resolveModel+stream）
+  abstract stream(options)          // 唯一必须实现的方法
+}</code></pre>
+<p>每个 provider HTTP 请求必须带 <code>attributionHeaders()</code>（产品 User-Agent 归因，见 attribution.ts）——<strong>契约要求在 wire 请求或库钩子里证明加了头</strong>。</p>
+<div class="analogy">
+= OkHttp 的 <code>Interceptor</code> + <code>Call.Factory</code>，或 JDBC 的 <code>Driver</code>/<code>Connection</code>：<code>registerAdapter(providers, adapter)</code> ≈ <code>DriverManager.registerDriver</code>；llm-deepseek、llm-pi-ai 就是两个"驱动"。Kotlin 开发者最熟悉的对应是 Ktor 引擎抽象：核心只认 <code>HttpClientEngine</code>，CIO/OkHttp/Netty 各自实现。
+</div>
+
+<h3>注册的三张表</h3>
+<table>
+  <tr><th>表</th><th>注册方法</th><th>语义</th></tr>
+  <tr><td>adapters</td><td><code>registerAdapter(providers, adapter)</code></td><td>路由 → 适配器。<strong>all-or-nothing</strong>：任一路由已被占则整批拒绝。返回 handle 可 <code>replace(next[])</code> <strong>原子换路由集</strong>（校验全过才提交，单同步段交换，观察者看不到缝隙）</td></tr>
+  <tr><td>directory</td><td><code>registerConfigurableProviders(entries)</code></td><td>"可配置 provider"目录：声明本插件<strong>能</strong>通过配置激活的路由（ dormant 也列出来——Models 页展示的就是这张表）</td></tr>
+  <tr><td>discoveries</td><td><code>registerModelDiscovery(ns, fn)</code></td><td>按 settings 命名空间的端点探测：给一个 baseURL+凭证，问出可用模型列表（<code>discoverModels</code>，Remote 可跨进程）</td></tr>
+</table>
+<p>三张表每次变更都 emit <code>llm/adapters-updated</code>（<strong>逐监听者圈禁</strong>——注释再次记录了 Cordis emit 用 Array.map、一个同步抛会饿死后续监听者的事实，所以这里手动圈禁）。llm-pi-ai 的"休眠"机制正是 directory 有声明、adapters 无路由；settings 写入 provider profile 后它 <code>replace()</code> 进路由表。</p>
+
+<h3>llm/stream 瀑布：全系统的模型调用都可拦截</h3>
+<pre><code>'llm/stream'(options, next): AsyncIterable&lt;StreamChunk&gt;</code></pre>
+<p>每次流式调用（不管 loop 发的还是插件手工发的）都过这个瀑布：可短路（自己产 chunk——重放/mock）、可包 next()（重试/路由）。<strong>LOOP 构建的请求带 <code>markAgentLoopRequest</code> 身份且深冻结（改就抛）</strong>——因为它必须是会话日志的纯函数（"可重建性"铁律的运行时强制）；手工调用不带标记，调用方自己负责不可变。</p>
+
+<h2 id="prepared">二、prepareCall：一次绑定的调用</h2>
+<p>第 04 篇 agent-loop 的 step 每次都走 <code>ctx.llm.prepareCall(config, signal)</code>。看它的实现，五个要点：</p>
+<ol>
+  <li><strong>绑定注册</strong>：捕获 registration（adapter + retryPolicy），后续 dispatch 用捕获的这一代——<strong>settings 中途变化不会让"这代的元数据"配"那代的端点"</strong></li>
+  <li><strong>adapterDefaults</strong>：调用方没给的 reasoningEffort/maxTokens，适配器解析后补上——并在 header 里记录"这是适配器补的而非调用方给的"（第 02 篇 requestProposal 反向剥掉它们）</li>
+  <li>上下文窗口、输入模态、systemPromptUpdate/toolUpdate 能力随调用解析冻结</li>
+  <li><strong>stream() 只许 dispatch 一次</strong>，且 options 的 config 与 prepare 的完全相等——防"准备一套、发另一套"</li>
+  <li>没有注册的 provider → <code>NO_ADAPTER</code>（agent-loop 有兜底分支：中间件可以服务未注册路由，但终派发必须有适配器）</li>
+</ol>
+<p>另有 <code>forAdapter()</code>：发给适配器前，把<strong>属于其他适配器路由的 replayState 剥掉</strong>（不同 provider 的私有重放数据互不污染）。</p>
+<div class="analogy">
+prepareCall ≈ <strong>OkHttp 的 Call 对象</strong>：newCall 时解析路由/DNS/超时，execute 只能一次；更贴切的是 <strong>数据库 PreparedStatement</strong>——准备时绑定计划，执行时校验参数一致性。adapterDefaults 的"标注来源"哲学 ≈ Android 里 <code>Bundle.containsKey</code> 的教训：分不清"用户没设"和"默认了"是无数 bug 的根源。
+</div>
+
+<h2 id="vocab">三、词汇文件</h2>
+<div class="filecard"><span class="lines">608 行</span><span class="path">types.ts</span> — 规范词汇。ContentBlock 闭合 union：text / reasoning（思考过程独立于可见文本）/ image（角色中立、attachment 引用、offload 占位）/ file（<strong>永不原生发给 provider</strong>，组装时投影成确定性句柄文本，日志保留结构引用）/ tool-call / tool-result / tool-addition / tool-removal。LlmFailure 是可序列化事实（message/code/status/retryAfter/requestId/offloadImages）。MessageSourceMap 是<strong>可合并扩展</strong>的"消息来源"表（model/tool/system-prompt/runtime-context/tool-registry…插件可加）。</div>
+<div class="filecard"><span class="lines">319 行</span><span class="path">message.ts</span> — Message 值类型与构造器（createUserMessage 等，全部走规范化+冻结）。</div>
+<div class="filecard"><span class="lines">510 行</span><span class="path">content.ts</span> — 内容块结构助手：文件→文本投影、图像→文本模型投影、工具增删投影（决定"这个 provider 能不能看见这类块"的守门逻辑）。</div>
+<div class="filecard"><span class="lines">76 行</span><span class="path">brand.ts</span> — 本包拥有的品牌 id（ToolCallId、ProviderRequestId 等）。</div>
+<div class="analogy">ContentBlock union ≈ Kotlin sealed class 层级 + 每个变体一个 @JvmInline 值类；"文件永不原生上 wire"≈ 聊天协议里把附件换算成占位符文本、原始引用存数据库的常见设计，但这里把"投影规则"集中到了一个文件而非散在各 adapter。
+</div>
+
+<h2 id="stream">四、流文件</h2>
+<div class="filecard"><span class="lines">208 行</span><span class="path">assembler.ts</span> — <strong>BlockAssembler</strong>：chunk → 内容块的<strong>唯一规范组装算法</strong>。agent-loop 用它装配 assistant 消息的同时记录原始 chunk（重放保真）。"单一算法"意味着每个 provider 的流式差异在 adapter 内部就被抹平，loop 一套代码面对所有 provider。</div>
+<div class="filecard"><span class="lines">533 行</span><span class="path">assistant-stream.ts</span> — 一次流尝试的<strong>无损紧凑表示</strong>（AssistantStreamRecord，就是 session 日志 assistant/message 里嵌的那个 stream）+ 不物化成员的记录级读取器（比如"usage 是多少"不用展开整条流）+ <code>expandAssistantStream</code> 校验展开。</div>
+<div class="filecard"><span class="lines">109 行</span><span class="path">adapter-failure.ts</span> — 适配器抛出值的归一化：任意 thrown → LlmFailure（第 03 篇 pipeline 的 toolErrorMessage 的 LLM 版）。</div>
+<div class="analogy">AssistantStreamRecord ≈ <strong>proto 的紧凑编码 + lazy 解码</strong>：磁盘上存增量、读取端按需回答；BlockAssembler ≈ Kotlin Flow 的 <code>scan</code> 累积器——增量进、规约出，且全仓库只有一份实现，两个消费者（UI 直播 + 持久重放）看到必然一致。
+</div>
+
+<h2 id="rest">五、其余文件</h2>
+<table>
+  <tr><td>call-config.ts（95）</td><td>LlmCallConfig（provider/model/effort/采样控制）+ callConfigEquals + <code>markAgentLoopRequest</code> 身份标记</td></tr>
+  <tr><td>retry-policy.ts（201）</td><td>provider 自有重试策略的解析与校验（llm-retry 插件消费它）</td></tr>
+  <tr><td>error.ts（233）</td><td>失败码表（AUTH/RATE_LIMIT/NO_ADAPTER/IMAGE_OFFLOAD_REQUIRED…）+ LlmError（HarnessError 子类，failure 字段保留可序列化事实——<code>fromFailure</code> 可把任何 provider 的失败按原 code 重新抛出）</td></tr>
+  <tr><td>attribution.ts（90）</td><td>产品 User-Agent 归因——所有 provider 请求必须带的非密身份，防各 adapter 漂移</td></tr>
+</table>
+
+<h2 id="summary">六、本篇要点 + 系列回顾</h2>
+<ol>
+  <li><strong>llm 是词汇 + 注册表，不是客户端</strong>：HTTP 细节全在 adapter 插件里（llm-deepseek、llm-pi-ai），核心只管路由、绑定、词汇和可拦截性。</li>
+  <li><strong>prepareCall 的"绑定一代"语义</strong>是动态配置安全的关键：解析与派发之间世界变了，也不会混用两代元数据/端点。</li>
+  <li><strong>单一组装算法 + 无损流记录</strong>：直播与重放必然一致，这是"模型可见 ⟺ 可从日志重建"在流式层面的兑现。</li>
+</ol>
+
+<h3>系列回顾（02–05 五个包，~1.2 万行）</h3>
+<table>
+  <tr><th>包</th><th>一句话</th></tr>
+  <tr><td>scope</td><td>注册向下继承、事件向上冒泡的作用域原语（空插件=所有权锚点）</td></tr>
+  <tr><td>session</td><td>事件溯源日志=唯一真相；表面=fold 出的模型视图；持久化是插件订阅</td></tr>
+  <tr><td>system-prompt</td><td>四类提示贡献的注册表+组装器，严格插值 fail-loud</td></tr>
+  <tr><td>tools</td><td>三层隔离注册表 + 三段式执行管线（取消永不放弃已启动的体）</td></tr>
+  <tr><td>agent / agent-loop</td><td>接口与驱动分离；turn/step 状态机；一切模型可见皆过日志；扩展点全部数据化</td></tr>
+  <tr><td>llm</td><td>中立流式词汇 + 适配器注册表；llm/stream 瀑布拦截一切调用</td></tr>
+</table>
+<p>五篇合起来就是一句设计哲学：<strong>把"谁在什么范围内贡献了什么、何时撤销"做成语言的根基，其余一切都是数据流经它</strong>。</p>
+
+<footer>
+MyDSH 架构讲解系列 · 第 05 篇（核心包部分完结）· <a href="index.html">返回索引</a> · 源码位置：<code>packages/llm/llm</code>
+</footer>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MyDSH 架构详解 03 — system-prompt 与 tools：提示组装与工具管线</title>
+<style>
+  :root { --fg:#1f2328; --muted:#59636e; --border:#d1d9e0; --bg-soft:#f6f8fa; --code-bg:#f6f8fa; --accent:#0969da; --warn-bg:#fff8c5; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:32px 16px 64px; font-family:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif; font-size:15px; line-height:1.75; color:var(--fg); background:#fff; }
+  main { max-width:980px; margin:0 auto; }
+  h1 { font-size:1.9em; border-bottom:1px solid var(--border); padding-bottom:.35em; }
+  h2 { font-size:1.35em; border-bottom:1px solid var(--border); padding-bottom:.3em; margin-top:2.2em; }
+  h3 { font-size:1.12em; margin-top:1.7em; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  code { font-family:Consolas,"Courier New",monospace; font-size:.92em; background:var(--code-bg); border:1px solid var(--border); border-radius:4px; padding:.12em .35em; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:6px; padding:12px 14px; overflow-x:auto; line-height:1.55; }
+  pre code { background:none; border:none; padding:0; font-size:.88em; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:6px 12px; text-align:left; vertical-align:top; }
+  th { background:var(--bg-soft); }
+  blockquote { margin:1em 0; padding:.5em 1.1em; border-left:4px solid var(--accent); background:var(--bg-soft); }
+  .analogy { margin:1.2em 0; padding:.6em 1.1em; border-left:4px solid #bf8700; background:var(--warn-bg); border-radius:0 6px 6px 0; }
+  .analogy::before { content:"🐹 类比 · "; font-weight:700; color:#7d5900; }
+  ul,ol { padding-left:1.6em; } li { margin:.3em 0; }
+  .toc { background:var(--bg-soft); border:1px solid var(--border); border-radius:6px; padding:12px 20px; }
+  .toc ul { padding-left:1.2em; margin:.3em 0; }
+  footer { margin-top:3em; color:var(--muted); font-size:.9em; border-top:1px solid var(--border); padding-top:1em; }
+  .series { display:inline-block; background:var(--bg-soft); border:1px solid var(--border); border-radius:999px; padding:2px 12px; font-size:.88em; color:var(--muted); margin-bottom:1em; }
+  .filecard { border:1px solid var(--border); border-radius:8px; padding:10px 16px; margin:1em 0; background:var(--bg-soft); }
+  .filecard .path { font-family:Consolas,monospace; font-weight:700; color:#0550ae; }
+  .filecard .lines { float:right; color:var(--muted); font-size:.88em; }
+</style>
+</head>
+<body>
+<main>
+
+<span class="series">MyDSH 架构讲解 · 第 03 篇 · <a href="index.html">返回索引</a></span>
+<h1>system-prompt 与 tools：提示组装与工具管线</h1>
+
+<p>本篇覆盖模型请求的两大输入面：<strong>提示词从哪来</strong>（system-prompt，700 行单文件）和<strong>工具怎么定义、怎么被安全地执行</strong>（tools，3797 行、10 个文件）。</p>
+
+<nav class="toc">
+<strong>目录</strong>
+<ul>
+  <li><a href="#sp">一、system-prompt：有序分节注册表</a></li>
+  <li><a href="#tools-registry">二、tools 之 index.ts：注册表与视图解析</a></li>
+  <li><a href="#tools-events">三、tools 之 events.ts：四个扩展点</a></li>
+  <li><a href="#tools-contracts">四、tools 之 contracts.ts：契约词汇</a></li>
+  <li><a href="#tools-pipeline">五、tools 之 pipeline.ts：共享执行管线</a></li>
+  <li><a href="#tools-rest">六、tools 其余文件一览</a></li>
+  <li><a href="#summary">七、本篇要点</a></li>
+</ul>
+</nav>
+
+<h2 id="sp">一、system-prompt：有序分节注册表（src/index.ts，700 行）</h2>
+
+<p>解决的问题：系统提示不是一整段字符串，而是<strong>几十个插件各自贡献碎片、按序拼装、每次模型步骤重新组装</strong>。这个包提供一个 Cordis Service（<code>ctx.systemPrompt</code>），管四类注册：</p>
+
+<table>
+  <tr><th>注册项</th><th>方法</th><th>说明</th></tr>
+  <tr><td>节（section）</td><td><code>section()</code></td><td>系统提示的正文碎片，<code>order</code> 排序；可静态文本或函数；<code>complete: true</code> 表示"我是完整提示"（多个 complete 同时激活则报错）</td></tr>
+  <tr><td>动态上下文</td><td><code>context()</code></td><td>运行时快照（工作目录、沙箱策略、审批策略……），以 user 消息形式注入；<code>required: true</code> 的不会被抑制</td></tr>
+  <tr><td>变量</td><td><code>variable()</code></td><td><code>{{name}}</code> 插值源，每次组装求值</td></tr>
+  <tr><td>工具 schema</td><td><code>tools()</code></td><td>Provider 每次组装返回本步可见的工具 schema</td></tr>
+</table>
+
+<h3>三个关键设计</h3>
+
+<p><strong>(1) 顺序是治理问题，不是细节。</strong> 包里有一个 65 项的 <code>SECTION_ORDERS</code> 中央分配表（HARNESS_IDENTITY=-1000、各工具 1000~3000、PERSONA 后缀 10200……）。每个仓库内插件通过 <code>getSectionOrder('TOOL_READ')</code> 领自己的位置——<strong>提示里谁先谁后跨包协商，而不靠数字魔法</strong>。</p>
+<div class="analogy">
+这个分配表 = Android 的 <code>Broadcast</code> priority 或 Netty 的 handler 顺序表：多插件共写一个产物时，顺序必须有个"户口管理处"。没有它，两个插件各写 100 就冲突了。
+</div>
+
+<p><strong>(2) 组装流程（assemble）。</strong> 变量求值（全局先、沿作用域链近者覆盖）→ 分节合并（同名 shadow）→ 工具 provider 求值 + <code>toolOrder</code> 排序（配置可指定顺序，必须含 <code>&lt;unlisted-tools&gt;</code> 锚点，未知名报错）→ <strong>瀑布 <code>system-prompt/assemble</code></strong> 让监听者可改写 → 若有 complete 节则在瀑布后<strong>恢复为唯一节</strong>（瀑布不能冒名顶替完整提示）。</p>
+
+<p><strong>(3) 严格插值（renderPrompt）。</strong> <code>{{var}}</code> 是<strong>严格</strong>的：未知变量、未赋值、畸形引用——全部抛错，绝不静默留空。连"孤立的 <code>{{</code> 后面没有 <code>}}</code>"都区分了"后面还有 <code>}}</code>（畸形，报错）"和"就是字面文字（放行）"。防的原型链污染也有：<code>Object.hasOwn</code> 检查。<code>interpolate: false</code> 的节保留字面文本。</p>
+<div class="analogy">
+vs. 模板引擎的 "missing key 渲染成空" 行为——这里反其道而行：<strong>fail-loud</strong>。因为系统提示里的空变量不是显示问题，是<strong>模型行为问题</strong>（模型会看到空洞的指令）。教训都写在错误消息里。
+</div>
+
+<p>另有 <code>refreshContext(assembly)</code>：工具批次中途想刷新运行时事实（如用户改了审批策略），只重求 context providers，不重跑分节/工具/变量——<strong>承认的部分不回锅</strong>。</p>
+
+<h2 id="tools-registry">二、tools/index.ts：注册表与视图解析（412 行）</h2>
+
+<p><code>ToolsService</code>（<code>ctx.tools</code>）管三样东西，全部用第 02 篇讲的 <code>ScopedLayers</code> 承载：</p>
+
+<ul>
+  <li><strong>工具注册</strong>（<code>ToolLayer.tools</code>）：<code>register(definition, {when})</code>。注册时即校验 output 声明（schema/render 必备）、JSON Schema 子集合法性、timeoutMs。保留名 <code>run_code</code> 直接拒绝（PTC 传输名）。</li>
+  <li><strong>限制（restriction）</strong>（<code>ToolLayer.restrictions</code>）：<code>restrict({allow?, deny?})</code> 只能作用于<strong>全局工具</strong>、只能在 agent 作用域里调（全局限制会罩住所有 agent——报错消息直接教你去给目标 agent deny）。多条限制<strong>相交</strong>；空过滤器和未知名都报错（"空过滤器几乎总是物化为空的配置 bug"）。</li>
+  <li><strong>守卫（guard）</strong>（独立 <code>GuardLayer</code>）：<code>guard(fn)</code> 单调否决——只能拒绝，不能批准，所以监听顺序无法把"拒绝"变回"允许"。</li>
+</ul>
+
+<h3>view(scope)：一次遍历解析完整视图</h3>
+<p>核心私有方法，规则：</p>
+<ul>
+  <li>全局 + 祖先作用域的注册作为<strong>继承集</strong>，本作用域自己的注册<strong>豁免</strong>所有限制</li>
+  <li>限制沿链<strong>全部相交</strong>（<code>layers.every(layer =&gt; layer.admits(name))</code>）</li>
+  <li>近的 shadow 远的；被限制掉的全局工具读作"不存在"</li>
+  <li>同时产出 <code>knownNames</code>（限制前全集，给 toolOrder 校验）和 <code>restrictableNames</code>（给 restrict 校验）</li>
+</ul>
+<div class="analogy">
+= CSS 的"文档级样式 + 更具体选择器覆盖"+ Android 权限的"默认拒绝 + 显式清单"。守卫的单调性（只否不许）= 安全审计原则：拒绝不可被后续步骤翻案。
+</div>
+
+<h3>resolve 与 ResolvedToolSet：步骤级激活</h3>
+<p>注册可带 <code>when(context)</code> 条件（agent + 本步模型选择 + 取消信号）。<code>resolve()</code> 在步骤开始时<strong>一次性解析全部条件</strong>，产出冻结的 <code>ResolvedToolSet</code>：之后 <code>view(scope)</code> 只对"仍以同一注册可见"的已准入项放行——中途卸载的工具<strong>不会</strong>被迟到的条件结果复活。取消时无部分选择发布（先 throwIfAborted 再全量提交）。</p>
+
+<h3>执行器接缝（ToolExecutor）</h3>
+<p><code>setExecutor()</code> 注册"工具执行器"（native 本进程执行 / PTC 程序化传输，每作用域至多一个）。执行器可带提示节（<code>sections</code>），由 registry 代为注册成 system-prompt 节，且文本函数运行时先自检"我仍是当前 scope 选中的执行器"——<strong>执行器卸载后其提示节自动渲染为空</strong>。卸载时把 <code>record.executor</code> 置 undefined 而非删记录：让"不可用"状态显式存在，调用落不下去也不会静默换人（<code>ToolExecutorUnavailableError</code>）。</p>
+
+<h2 id="tools-events">三、tools/events.ts：四个扩展点（58 行）</h2>
+<p>全部是声明合并到 Cordis 事件表的类型声明，每个事件的 JSDoc 就是契约全文：</p>
+<table>
+  <tr><th>事件</th><th>模式</th><th>语义</th></tr>
+  <tr><td><code>tools/pre-execute</code></td><td>瀑布</td><td>allow / deny / cancel / <strong>ask</strong>（升级为人工审批）。异步闸门必须观测 <code>exec.signal</code></td></tr>
+  <tr><td><code>tools/execute</code></td><td>瀑布（环绕）</td><td>超时、重试、度量的挂点。包装者可换 signal，但"调用身份不可变"；registry 会把原始取消信号<strong>重新熔断</strong>进去（防包装者割断调用方取消）</td></tr>
+  <tr><td><code>tools/post-execute</code></td><td>瀑布</td><td>accept / 替换投影 / <strong>block</strong>（把矫正反馈变成错误结果），可附加 additionalContexts</td></tr>
+  <tr><td><code>tools/result</code></td><td>emit</td><td>观察冻结的最终结果，监听失败被圈禁</td></tr>
+</table>
+<div class="analogy">
+三段瀑布 = OkHttp 的 <code>applicationInterceptors</code>（pre）+ <code>networkInterceptors</code>（around）+ 出站改写（post）；<code>ask</code> = OkHttp 里没有的东西，更像 <strong>Android RuntimePermissions</strong>：策略升级到人工批准。signal 重熔断 = Kotlin 里 <code>withContext(NonCancellable)</code> 的反面：框架保证父取消<strong>一定</strong>传导到工具体，包装者换不掉。
+</div>
+
+<h2 id="tools-contracts">四、tools/contracts.ts：契约词汇（418 行）</h2>
+<p>纯类型 + 少量错误类，但每条都值得读：</p>
+<ul>
+  <li><strong>ToolDefinition</strong>：schema + <code>execute</code> + <strong>必备 <code>output</code></strong>（schema/render/presentationMeta）。工具体<strong>只返回 JSON value</strong>，渲染成 ContentBlock 是 output.render 的事——把"值"和"展示"分离，让结果可校验、可重放</li>
+  <li><strong>三段内容钩子</strong>：<code>projectContent</code>（post-execute 前）/ <code>finalizeContent</code>（最后一步，必须全函数不抛）/ <code>presentCall</code>/<code>presentResult</code>（UI 卡片，纯函数——<strong>会话日志重放时会再调一遍</strong>，所以不得有副作用）</li>
+  <li><strong>isConcurrencySafe</strong>：只有显式 <code>true</code> 才允许并行；声明它即断言"会转发 signal、能达到静默"——opt-in 契约写在注释里</li>
+  <li><strong>取消语义</strong>：<code>TOOL_ABORTED</code>（体已启动）/ <code>TOOL_ABORTED_BEFORE_DISPATCH</code>（体未启动）两个规范码——重放和恢复逻辑靠它们区分"结果未知"和"根本没跑"</li>
+  <li><strong>PreToolDecision / PostToolDecision</strong>：封闭 union，post 的 accept "value 和 content 二选一"由两个互斥变体编码（编译器拒绝同时给）</li>
+  <li>错误类全部继承 HarnessError 带 code：<code>UNKNOWN_TOOL</code>、<code>INVALID_TOOL_OUTPUT</code>、<code>TOOL_CONTEXT_UNAVAILABLE</code>——可路由、可判定</li>
+</ul>
+
+<h2 id="tools-pipeline">五、tools/pipeline.ts：共享执行管线（807 行）</h2>
+<p><code>ToolExecutionPipeline</code>——所有执行器共享的"政策机"。三段式调度：<code>prepare()</code> → <code>dispatch()</code> → <code>complete()</code>。为什么分三段？因为<strong>批量调度器需要先对全部调用跑完前置政策（prepare），再决定并发排布，然后逐个跑体（dispatch），最后按模型顺序结案（complete）</strong>。</p>
+
+<h3>prepare：身份铸造 + 前置政策</h3>
+<ol>
+  <li><code>createExecution</code>：参数一次 <code>snapshotJsonValue</code>（防有状态 getter 的 TOCTOU）+ 深冻结；铸造 Symbol token；捕获 finalizer/projector <strong>在参数 getter 跑之前</strong>（getter 可能干任何事）</li>
+  <li>取消检查 → <code>tools/pre-execute</code> 瀑布 → ask 走审批接缝（<code>ctx.get('approval')</code> 机会主义获取——没组审批服务就降级为 deny，agent 缺失同样降级）→ 守卫检查 → 再查取消</li>
+  <li>每一步失败都有明确归宿：政策异常 → final-result 错误；executor 拒绝但调用方已取消 → <strong>取消优先于拒绝</strong>（记录的是 aborted 而非 denied）</li>
+</ol>
+
+<h3>dispatch：环绕 + 体执行 + 信号熔断</h3>
+<p>瀑布 <code>tools/execute</code> 包住 <code>dispatchToolBody</code>。<strong>信号熔断（fuseToolSignals）</strong>是本文件最精巧的 20 行：包装者换上的 signal 和原始调用方 signal 手动双向联动（不用 <code>AbortSignal.any</code> 嵌套，dispatch 结束即拆监听器）。承诺：<strong>取消永不放弃已启动的体</strong>——启动的 promise 一定跑到静默，之后结果才被改写成 ABORTED。错误分类：取消后抛出的"无身份"错误（signal.reason 或裸 AbortError）归一化为 ABORTED 码但保留消息；HarnessError 和其他错误原样保留。</p>
+<div class="analogy">
+三段式 = <strong>OkHttp 的 executedCall 生命周期</strong>（enqueue → run → complete）+ 数据库连接池的"借出/归还"。<code>bodyInvoked</code> 标志 = JVM 的 Thread.interrupt 语义（ cooperative，不硬杀）：框架不 kill 你的线程，但你必须观测取消并在完成后让框架把结果归类为"中止"。信号熔断 ≈ Kotlin <code>coroutineScope + Job 的 parentChild 关系</code>——子取消不影响父，父取消必达子。
+</div>
+
+<h3>complete：post 政策 + 双重物化 + 冻结发布</h3>
+<p><code>projectContent</code> → <code>postExecute</code> 瀑布 → 取消替换（只替换<strong>成功</strong>结果；工具自身错误保留）→ <code>finish()</code>：先物化结果、再跑 <strong>finalizeContent</strong>、再物化一次、<strong>Object.freeze(exec)</strong> 后 emit <code>tools/result</code>。两段 try/catch 确保"物化失败也变成错误结果"而不是炸穿管线。<code>canonicalResults</code> WeakMap 用 token 认证"registry 规范化过"的结果——包装者仿造的结果会被 <code>normalizeDispatchResult</code> 重新过一遍 output 契约校验。</p>
+
+<h2 id="tools-rest">六、tools 其余文件</h2>
+<div class="filecard"><span class="lines">285 行</span><span class="path">batch.ts</span> — <code>executeToolBatch</code>：一个步骤内多个工具调用的调度器。独占调用形成栅栏；并行调用进有界滚动池、<strong>启动前重新分类</strong>（防止独占调用饿死）。政策与结果保持<strong>模型顺序</strong>，只有 dispatch 可重叠。中止给跳过的调用合成错误结果（重放合法性），内部失败先排空再抛 ToolBatchExecutionError（带 partial）。</div>
+<div class="analogy">= Kotlin <code>coroutineScope</code> 里混合 <code>launch</code>（并行）与顺序 <code>await</code>（栅栏）的调度器，外加"取消也要凑齐每调一果"的账本纪律。</div>
+<div class="filecard"><span class="lines">646 行</span><span class="path">schema.ts</span> — 仓库自己的<strong>类型安全 schema DSL</strong>（<code>z.string()</code> 风格）+ <code>defineTool</code> 辅助：让工具作者用类型正确的 spec（string enum 就得是 string 数组）写 schema，编译期防手滑；再投影成模型可见的 ToolSchema（白名单字段）。</div>
+<div class="analogy">= kotlinx.serialization 的 <code>@Serializable</code> + 自研 validator，或 Kotlinx <code>JsonObject</code> builder 加类型。类比 Ktor 里用 <code>ContentNegotiation</code> + 数据类替代手写 JSON。</div>
+<div class="filecard"><span class="lines">656 行</span><span class="path">json-schema.ts</span> — <strong>强制 JSON Schema 子集</strong>：只接受能真正 enforcement 的关键字（单 type、properties/required、items、标量 enum/const、exact-one oneOf），<strong>不认识的关键字拒绝而不是接受后不校验</strong>——"假装校验"比"不校验"更危险。工具输出、PTC 类型、subagent、workflow 共用这一套。</div>
+<div class="filecard"><span class="lines">102 行</span><span class="path">executor.ts</span> — <code>ToolExecutor</code> 接口（describe + execute 一个完整批次）与两个错误类。批次协议：一 call 一 result、<strong>输入顺序</strong>返回、绝不在有活没干完时 settle。</div>
+<div class="filecard"><span class="lines">389 行</span><span class="path">presentation.ts</span> — <strong>提供方中立的 UI 卡片词汇</strong>：ToolCallView = generic / terminal / diff 三种标记意图 + FileLocation（跟随跳转）+ 文件差异。工具声明"我这通调用是编辑文件"的方式是打 tag，而不是客户端去特判工具名——所以新工具零客户端改动就有像样的卡片。</div>
+<div class="filecard"><span class="lines">24 行</span><span class="path">error-codes.ts</span> — 审批三态错误码（REJECTED/CANCELLED/UNAVAILABLE）。持久化契约：只比字符串，不 re-export。</div>
+
+<h2 id="summary">七、本篇要点</h2>
+<ol>
+  <li>system-prompt 是<strong>注册表 + 组装器</strong>：分节/上下文/变量/工具四类贡献，严格插值 fail-loud，顺序由中央分配表治理。</li>
+  <li>tools 注册表的三层隔离（scoped shadow / restriction 相交 / guard 单调否决）全部建在 scope 包的 ScopedLayers 上——第 02 篇的原语在这里第一次大显身手。</li>
+  <li>执行管线是三段式状态机（prepare/dispatch/complete），贯穿三条铁律：<strong>取消永不放弃已启动的体</strong>（但也不认账为成功）、<strong>值与展示分离</strong>（输出契约校验）、<strong>物化即冻结</strong>。</li>
+  <li>审批（ask）是机会主义接缝：没组服务就降级为 deny，绝不静默放行。</li>
+</ol>
+
+<footer>
+MyDSH 架构讲解系列 · 第 03 篇 · <a href="index.html">返回索引</a> · 源码位置：<code>packages/core/system-prompt</code>、<code>packages/core/tools</code>
+</footer>
+
+</main>
+</body>
+</html>

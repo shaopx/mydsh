@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MyDSH 架构详解 04 — agent 与 agent-loop：注册表与驱动器</title>
+<style>
+  :root { --fg:#1f2328; --muted:#59636e; --border:#d1d9e0; --bg-soft:#f6f8fa; --code-bg:#f6f8fa; --accent:#0969da; --warn-bg:#fff8c5; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:32px 16px 64px; font-family:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif; font-size:15px; line-height:1.75; color:var(--fg); background:#fff; }
+  main { max-width:980px; margin:0 auto; }
+  h1 { font-size:1.9em; border-bottom:1px solid var(--border); padding-bottom:.35em; }
+  h2 { font-size:1.35em; border-bottom:1px solid var(--border); padding-bottom:.3em; margin-top:2.2em; }
+  h3 { font-size:1.12em; margin-top:1.7em; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  code { font-family:Consolas,"Courier New",monospace; font-size:.92em; background:var(--code-bg); border:1px solid var(--border); border-radius:4px; padding:.12em .35em; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:6px; padding:12px 14px; overflow-x:auto; line-height:1.55; }
+  pre code { background:none; border:none; padding:0; font-size:.88em; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:6px 12px; text-align:left; vertical-align:top; }
+  th { background:var(--bg-soft); }
+  blockquote { margin:1em 0; padding:.5em 1.1em; border-left:4px solid var(--accent); background:var(--bg-soft); }
+  .analogy { margin:1.2em 0; padding:.6em 1.1em; border-left:4px solid #bf8700; background:var(--warn-bg); border-radius:0 6px 6px 0; }
+  .analogy::before { content:"🐹 类比 · "; font-weight:700; color:#7d5900; }
+  ul,ol { padding-left:1.6em; } li { margin:.3em 0; }
+  .toc { background:var(--bg-soft); border:1px solid var(--border); border-radius:6px; padding:12px 20px; }
+  .toc ul { padding-left:1.2em; margin:.3em 0; }
+  footer { margin-top:3em; color:var(--muted); font-size:.9em; border-top:1px solid var(--border); padding-top:1em; }
+  .series { display:inline-block; background:var(--bg-soft); border:1px solid var(--border); border-radius:999px; padding:2px 12px; font-size:.88em; color:var(--muted); margin-bottom:1em; }
+  .filecard { border:1px solid var(--border); border-radius:8px; padding:10px 16px; margin:1em 0; background:var(--bg-soft); }
+  .filecard .path { font-family:Consolas,monospace; font-weight:700; color:#0550ae; }
+  .filecard .lines { float:right; color:var(--muted); font-size:.88em; }
+</style>
+</head>
+<body>
+<main>
+
+<span class="series">MyDSH 架构讲解 · 第 04 篇 · <a href="index.html">返回索引</a></span>
+<h1>agent 与 agent-loop：注册表与驱动器</h1>
+
+<p>这是整个系统最核心的两包。<strong>agent</strong>（1802 行）定义"Agent 是什么"和注册表；<strong>agent-loop</strong>（2155 行）是默认驱动器——第 01 篇那张 turn/step 流程图的实现本体。两者通过 <code>AgentFactory</code> 接缝解耦：注册表不知道怎么造 Agent，驱动器注册自己为工厂。理论上可以整体换掉驱动器。</p>
+
+<nav class="toc">
+<strong>目录</strong>
+<ul>
+  <li><a href="#agent">一、core/agent：注册表、工厂接缝、发起者</a></li>
+  <li><a href="#loop-factory">二、agent-loop/index.ts：工厂与生命周期事务</a></li>
+  <li><a href="#loop-agent">三、agent-loop/agent.ts：状态机本体（turn/step 主循环）</a></li>
+  <li><a href="#loop-rest">四、agent-loop 其余文件</a></li>
+  <li><a href="#summary">五、本篇要点</a></li>
+</ul>
+</nav>
+
+<h2 id="agent">一、core/agent：注册表、工厂接缝、发起者</h2>
+
+<div class="filecard"><span class="lines">690 行</span><span class="path">index.ts</span> — AgentRegistry 服务（ctx.agents）</div>
+
+<h3>AgentFactory：谁造 Agent？</h3>
+<p><code>AgentRegistry</code> 自己不造 Agent——通过 <code>setFactory()</code> 接收工厂（就是 agent-loop），<code>create()/resume()</code> 委托过去。消费者（如 ACP 桥）只依赖 <code>ctx.agents</code> 接口，不 import 具体的 loop 包。<strong>接口放在 agent 包、实现放在 agent-loop 包</strong>——典型的接口与实现分离（依赖倒置）。</p>
+<div class="analogy">
+= Java 的 <code>ServiceLoader</code> + <code>Executor</code> 模式：registry ≈ <code>ExecutorService</code>（管注册与查询），factory ≈ <code>ThreadFactory</code>（管构造）。也像 Hilt 的 <code>@Binds</code>：接口和 impl 分模块，消费方只见接口。
+</div>
+
+<h3>enter/announce：又一组两阶段发布</h3>
+<p>与 SessionStore 相同的手法（第 02 篇），语义也一致：先入店（enter，返回 detach），后广播（announce，<code>agent/created</code> 是 <strong>serial</strong> 模式——顺序 await，一个监听者失败则创建失败回滚）。嵌套细节同样讲究：detach 发生在 created 派发中途时延迟到派发收束，保证"每个观察过创建的监听者必能看到配对的 disposed"。</p>
+
+<h3>发起者（Initiator）：进程内因果归因</h3>
+<p>这是 agent 包最特别的设计：<code>withInitiator(agent, op)</code> 用 <code>AsyncLocalStorage</code> 把"哪个 Agent 发起了这条异步链"沿 Promise 链隐式传播；<code>currentInitiator()</code> 读它，<code>requireInitiator()</code> 强制要求有。典型用途：深处的基础设施代码（遥测、审计）想知道"我这是在替哪个 Agent 干活"，而不想给每层 API 加 agent 参数。</p>
+<p>但文档同时泼冷水：<strong>存在 ≠ 活着 ≠ 授权</strong>——ambient 归因只用于日志/度量，主体与所有者仍必须显式传递（worker/进程/持久化/网络边界处 ambient 语义全部失效）。还有 <code>withoutInitiator()</code>：建共享定时器/队列泵时<strong>清除</strong>继承，防止"第一个碰巧初始化它的 Agent"意外拥有一段共享基础设施。关闭期 <code>disposeInitiators</code> 排空全部在途边界后才 disable。</p>
+<div class="analogy">
+= Kotlin 协程的 <strong>CoroutineContext 元素传播</strong>（如 <code>CoroutineName</code>/MDC Context）——launch 的协程自动继承上下文；<code>withoutInitiator</code> ≈ <code>Dispatchers.Default + EmptyCoroutineContext</code> 起"无主"协程。AsyncLocalStorage 是 Node 的 ThreadLocal，但跨 async 边界。"存在不是授权"的告诫对应安全原则：ThreadLocal 里的用户身份不能当鉴权凭据用。
+</div>
+
+<div class="filecard"><span class="lines">432 行</span><span class="path">runtime-types.ts</span> — Agent 接口与 agent/* 事件表</div>
+<p>Agent 的完整行为面（声明合并进 Agent 接口）+ 全部事件契约。要点：</p>
+<ul>
+  <li><strong>四种输入通道</strong>：<code>followup</code>（新轮次）、<code>steer</code>（塞进下一个 step 边界——运行中生效）、<code>inject</code>（注入上下文，不唤醒）、通用 <code>send(target, wakeup)</code>。inbox 持久化为 <code>agent/inbox/spliced</code> 会话事件——<strong>排队中的消息崩溃不丢</strong>。</li>
+  <li><strong>状态只有两态</strong>：<code>idle ⇄ running</code>（maintenance 对外也是 idle）。取消带 cause（user/parent/hook/disposed），<code>keepInbox</code> 选项保留未开工的工作。</li>
+  <li><strong>事件表的 @mode 注释就是调度语义</strong>：<code>agent/created</code> serial（顺序待 await）、<code>agent/pre-step</code> waterfall（可拒绝/改写）、<code>agent/request-error</code> waterfall（可接管重试）、<code>agent/turn-stopping</code> serial（可反对关轮——反对的方式是 steer 进新输入）、<code>agent/assistant-stream</code> emit（瞬态流帧）。</li>
+  <li><code>agent/request</code> 已标 <strong>@deprecated</strong>：模型/推理力度应走 <code>agent.model.select()</code>——新旧扩展点的交替现场。</li>
+</ul>
+
+<div class="filecard"><span class="lines">432 行</span><span class="path">其余五个小文件</span></div>
+<table>
+  <tr><td>types.ts（123）</td><td>Agent/InboxTarget/ModelSelection 基础类型</td></tr>
+  <tr><td>dispatch.ts（176）</td><td>agentEvents/emitAgentEvent：作用域过滤的事件派发辅助（scopeTarget 的 agent 版）</td></tr>
+  <tr><td>model-selection.ts（175）</td><td>AgentModel + 模型选择投影（fold model/selection 事件；"记录过的选择 &gt; 上次请求 &gt; options"优先级）</td></tr>
+  <tr><td>consumed-work.ts（109）</td><td>已消费工作的簿记类型</td></tr>
+  <tr><td>archive-admission.ts / projection.ts（97）</td><td>归档准入（工作区想隐藏会话前先问"还有活着的轮次吗"）+ 轮次边界投影</td></tr>
+</table>
+
+<h2 id="loop-factory">二、agent-loop/index.ts：工厂与生命周期事务（844 行）</h2>
+
+<h3>FactoryOwnership：工厂级所有权账本</h3>
+<pre><code>class FactoryOwnership {
+  track(dispose)          // 记录每个存活 agent 的 teardown
+  trackStartup(job)       // 记录配置启动工作
+  dispose()               // 全部排空，收集失败抛 AggregateError
+}</code></pre>
+<p>插件卸载时，<strong>所有它造的 agent + 所有在途启动任务</strong>都要排空到静默才能收尾；多个失败聚合成一个 <code>AggregateError</code>（不吞任何一个）。</p>
+
+<h3>initializeAgent：一场严密的创建事务</h3>
+<p>这是全包最难也最精彩的函数。从已获得的 Session 到发布 Agent，回滚覆盖全程：</p>
+<ol>
+  <li>熔断两个 abort 源：调用方 signal + 工厂 teardown → 一个 AbortController</li>
+  <li><strong>逆序 teardown 计划</strong>（memoized，所有竞争的所有者 await 同一个静默）：停机器 → 撤作用域 → 排空并关闭持久化写柄 → 离开两个注册表 → 释放簿记。失败收集不吞</li>
+  <li>用<strong>一个生成器 effect 把生命周期钉在 owner fiber 上</strong>：<code>yield created.scope.rawDispose; yield () => teardown()</code>——yield 的顺序<strong>就是</strong>卸载顺序，这是 Cordis "exact disposer identity" 规则的实战（yield 包装函数会让 teardown 变成并发兄弟而非有序子步骤——注释里写了后果：agent 在最后一个轮次还在排水时就被注销）</li>
+  <li>发布序列（在 <code>runMaintenance</code> 里跑，占住 idle 相位）：补存未入库事件 → session.enter+announce → setup 回调（可返回同步 commit()，在发布前再校验一次）→ agents.enter+announce → ready</li>
+  <li>任何一步失败：<code>cancel({kind:'disposed'}, {keepInbox: true})</code> + 全量 dispose——<strong>已提交的 session 事件保留，排队的输入不丢</strong></li>
+</ol>
+<div class="analogy">
+这就是 <strong>结构化并发的生命周期版</strong>：Kotlin 里你写 <code>withContext(supervisorJob) { try { … } finally { cleanup() } }</code>，但这里的"finally"要跨 <em>两个注册表 + 持久化写柄 + Cordis fiber 树</em> 保持全序。生成器 yield 定序 teardown ≈ Kotlin <code>CoroutineScope</code> 里 child job 的注册顺序决定取消顺序——顺序是语义，不是实现细节。
+</div>
+
+<h3>resume：崩溃修复在现场</h3>
+<p><code>resumeWith</code> 的读路径藏着第 02 篇 repair.ts 的调用现场：先拿<strong>写所有权</strong>（排除并发同 id resume）→ 冷读全量日志 → <code>interruptedTurnClosers</code> 为崩溃尾巴合成关闭事件（悬空工具补错误结果）→ 以 repair 后的日志为 seed 构造 Session。取消与所有者卸载全部用 <code>AbortSignal.any</code> 熔断，后到的值（如 handle）通过 <code>releaseAbandoned</code> 回调释放——<strong>取消不泄漏晚到的资源</strong>。</p>
+
+<h3>配置化 agent</h3>
+<p>Config 的 <code>agents[]</code> 支持启动时创建/恢复 agent（cordis.yml 声明式）。身份可以由 launcher 通过 <code>CONFIGURED_AGENT_IDENTITIES_KEY</code> 注入（这样 overlay 改模型路由不会弄丢会话身份）；resume 不存在的 id 只在 <code>SessionPersistenceNotFoundError</code> 时降级为 create，<strong>损坏和冲突保持响亮</strong>。</p>
+
+<h2 id="loop-agent">三、agent-loop/agent.ts：状态机本体（751 行）</h2>
+
+<h3>Phase 状态机：idle / maintenance / running</h3>
+<pre><code>type Phase = { kind: 'idle'; lastTurn } | { kind: 'maintenance'; abort; lastTurn; wakeRequested }
+          | { kind: 'running'; abort; turn; step; wakeRequested }</code></pre>
+<p>外部只见 idle⇄running。<code>wakeRequested</code> 是<strong>闩锁</strong>：维护中/已中止的驱动收到唤醒请求时存起来，收敛到 idle 时重放。取消永远先 clear inbox（除非 keepInbox），再 abort——"队列持久化失败不得阻止已许可工作的取消"。</p>
+
+<h3>turn()：一轮的完整骨架</h3>
+<pre><code>append('turn/start') → 循环 {
+  preStep(target)                    // 认领 inbox + 组装 + 瀑布
+  reject → turnEnds=blocked，无 step
+  空消息且 step=0 → completed（花了边界但没花模型调用）
+  append('step/start')；ToolCallRecovery 随听 session/event
+  stepEnd = await step(decision)     // max-tokens 粘性：后续 completed 不降级
+  异常 → 补记悬空工具结果再抛
+  append('step/end')；toolSet.dispose()
+  turnEnds 且 nextStep 空 → serial('agent/turn-stopping') → break
+  target = 'next-step'
+} finally { append('turn/end', reason) }
+还有排队输入 → 重开一个 turn（新 AbortController）</code></pre>
+<p>每个出口都落一个结构化的 <code>TurnEndReason</code>；中止/错误/失败分别成型；<code>throwError</code> 先 emit <code>agent/error</code> 再抛给驱动边界圈禁。<strong>turn-stopping 的反对机制</strong>：监听者想续就 <code>agent.steer()</code> 塞新输入，机器重读 inbox——"数据决定，监听顺序改变不了结果"。</p>
+
+<h3>preStep 与 step：前两篇全部汇合</h3>
+<p>preStep：认领 inbox（<code>model.current()</code> 无选择直接报错）→ <code>tools.resolve()</code>（第 03 篇的步骤准入）→ <code>systemPrompt.assemble()</code>（第 03 篇组装）→ <code>agent/pre-step</code> 瀑布（拒绝/改写）。</p>
+<p>step 的每次模型请求（while true，重试可再来）：</p>
+<ol>
+  <li><strong>prepareRequest</strong>：agent/request 瀑布（已弃用但仍跑）只许改控制项——<strong>试图改 provider/model/effort 直接抛错</strong>（错误消息教你用 <code>agent.model.select()</code>）</li>
+  <li><code>refreshContext</code> 刷新运行时事实 → systemPrompt 投影决策（in-history 路由 vs 归一化）→ <code>system/message</code> 提交</li>
+  <li>首次尝试才提交认领的用户消息（重试不重复提交）</li>
+  <li><strong>buildRequest</strong>：header 三态记录（initial/resume、change、series）+ <strong>工具增减自动生成 developer/message</strong>（模型可见的工具演化史）→ <strong>messages = session.deriveMessages()</strong> 冻结 + <code>toolHistory</code> → 不可变请求对象</li>
+  <li>流式：chunk → AssistantStreamAttempt（瞬态帧 emit + 持久累积），成功 settle 成 <code>assistant/message</code>，失败 settle 成 <code>assistant/attempt</code>；<strong>中止时已交付的前缀 finalize 成 interrupted 的 assistant/message</strong>（UI 已显示的内容不凭空消失）</li>
+  <li>失败 → <code>agent/request-error</code> 瀑布，监听者可接管重试（<code>{kind:'retry'}</code> 不调 next）</li>
+  <li>无工具调用 → completed；有 → <code>tools.execute()</code> 整批（第 03 篇管线），additionalContexts 塞回 next-step，<code>concludesTurn</code> 让工具终结轮次</li>
+</ol>
+<div class="analogy">
+ReactLoopAgent 之所以叫 React：驱动核心是"事件（inbox/工具结果）→ 重算（组装/派生）→ 提交（append）→ 再看有没有新事件"的循环，像 React 的 setState → render → commit。turn-stopping 的"数据决定"= React 的"状态是唯一真相，不在事件里改状态"。整个 step 函数就是一张教科书级的状态转移表，每一行的 catch/finally 都对应一个真实的事故场景。
+</div>
+
+<h2 id="loop-rest">四、agent-loop 其余文件</h2>
+<div class="filecard"><span class="lines">232 行</span><span class="path">inbox.ts</span> — 持久化收件箱。核心是 <code>inboxProjection</code>：把 <code>agent/inbox/spliced</code> 事件 fold 回两个队列（next-turn/next-step），zod 校验 splice 合法性（越界/重复 id 拒绝）。<strong>排队消息活在会话日志里</strong>，崩溃恢复后原样回来。</div>
+<div class="filecard"><span class="lines">141 行</span><span class="path">assistant-stream.ts</span> — AssistantStreamAttempt：一次模型尝试的框架。三路输出一份输入：瞬态 chunk 帧（UI 打字机）、持久压缩流（AssistantStreamAccumulator）、组装后的内容块（BlockAssembler）。settle 只许一次。</div>
+<div class="filecard"><span class="lines">181 行</span><span class="path">runtime-context.ts</span> — 运行时上下文与系统提示的<strong>入史决策</strong>：runtime-context 快照的"取代"框架（新快照声明取代旧快照）、SystemPromptCommit 决定 append 还是 replace、以及按请求系列规则的扫描回放。</div>
+<div class="filecard"><span class="lines">6 行</span><span class="path">constants.ts</span> — DEFAULT_MAX_PARALLEL_TOOL_CALLS。</div>
+
+<h2 id="summary">五、本篇要点</h2>
+<ol>
+  <li><strong>接口与实现分离</strong>：agent 包定义 Agent/工厂接缝/事件表，agent-loop 实现；替换驱动器理论上可行，"改 agent-loop 要改 architecture.md"是它唯一的特权。</li>
+  <li><strong>生命周期是一等公民</strong>：enter/announce 两阶段、逆序 teardown 计划、yield 定序、失败收集不吞、取消不泄漏晚到资源——四篇里反复出现同一套纪律，这里达到顶点。</li>
+  <li><strong>一切模型可见的东西都过日志</strong>：请求从 <code>deriveMessages()</code> 冻结，工具增减生成 developer/message，连排队输入都是事件——这是第 02 篇"日志即真相"的完全体。</li>
+  <li><strong>扩展点全部数据化</strong>：pre-step 拒绝/改写、request-error 接管重试、turn-stopping 用 steer 反对、工具 concludesTurn 终结——插件改变行为靠数据而不靠顺序。</li>
+</ol>
+
+<footer>
+MyDSH 架构讲解系列 · 第 04 篇 · <a href="index.html">返回索引</a> · 源码位置：<code>packages/core/agent</code>、<code>packages/core/agent-loop</code>
+</footer>
+
+</main>
+</body>
+</html>

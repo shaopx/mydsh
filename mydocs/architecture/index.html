@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MyDSH 架构讲解系列 — 索引</title>
+<style>
+  :root { --fg:#1f2328; --muted:#59636e; --border:#d1d9e0; --bg-soft:#f6f8fa; --accent:#0969da; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:32px 16px 64px; font-family:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif; font-size:15px; line-height:1.75; color:var(--fg); background:#fff; }
+  main { max-width:860px; margin:0 auto; }
+  h1 { font-size:1.9em; border-bottom:1px solid var(--border); padding-bottom:.35em; }
+  h2 { font-size:1.3em; margin-top:2em; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  code { font-family:Consolas,monospace; font-size:.92em; background:var(--bg-soft); border:1px solid var(--border); border-radius:4px; padding:.12em .35em; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; }
+  th,td { border:1px solid var(--border); padding:8px 14px; text-align:left; vertical-align:top; }
+  th { background:var(--bg-soft); }
+  .card { display:block; border:1px solid var(--border); border-radius:8px; padding:14px 18px; margin:14px 0; background:var(--bg-soft); }
+  .card:hover { border-color:var(--accent); }
+  .card .num { font-size:.8em; color:var(--muted); letter-spacing:.08em; }
+  .card .title { font-size:1.15em; font-weight:700; margin:.15em 0; }
+  .card .desc { color:var(--fg); }
+  footer { margin-top:3em; color:var(--muted); font-size:.9em; border-top:1px solid var(--border); padding-top:1em; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>MyDSH 架构讲解系列</h1>
+
+<p>本系列面向有 <strong>Kotlin / Java / Dart</strong> 背景的读者，逐文件讲解 MyDSH（DeepSeek Harness fork）的核心源码。每篇以仓库权威文档为纲、以源码为据，每个新概念配你熟悉技术栈的类比（🐹 标记）。</p>
+
+<h2>篇目</h2>
+
+<a class="card" href="01-整体架构与核心概念.html">
+  <div class="num">第 01 篇</div>
+  <div class="title">整体架构与核心概念</div>
+  <div class="desc">分层结构、Cordis 微内核三概念（ctx / 可逆 effect / typed events）、profile→bundle→patch 组合机制、turn/step 生命周期总览、Desktop 启动链路、我们的定制在架构中的位置。</div>
+</a>
+
+<a class="card" href="02-scope与session详解.html">
+  <div class="num">第 02 篇 · core/scope + core/session</div>
+  <div class="title">作用域原语与事件溯源日志</div>
+  <div class="desc">scope（471 行）：注册向下继承、事件向上冒泡、空插件当所有权锚点。session（3490 行）：SessionEventMap 事件表逐个讲、Session/SessionStore 两阶段发布、surface 表面折算（日志 ≠ 模型历史）、fork/repair/工具史。9 个文件逐一覆盖。</div>
+</a>
+
+<a class="card" href="03-system-prompt与tools详解.html">
+  <div class="num">第 03 篇 · core/system-prompt + core/tools</div>
+  <div class="title">提示组装与工具管线</div>
+  <div class="desc">system-prompt（700 行）：分节/上下文/变量/工具四类注册、中央顺序表、严格插值。tools（3797 行）：三层隔离注册表（shadow/相交限制/单调守卫）、ResolvedToolSet 步骤准入、prepare→dispatch→complete 三段式执行管线、信号熔断、审批 ask 接缝、batch 调度器、schema DSL。10 个文件逐一覆盖。</div>
+</a>
+
+<a class="card" href="04-agent与agent-loop详解.html">
+  <div class="num">第 04 篇 · core/agent + core/agent-loop</div>
+  <div class="title">注册表与驱动器</div>
+  <div class="desc">AgentFactory 接缝、AsyncLocalStorage 发起者归因、initializeAgent 创建事务（yield 定序 teardown）、resume 现场崩溃修复、ReactLoopAgent 状态机（turn/step 主循环逐段拆解）、持久化收件箱、assistant 流三路输出。14 个文件覆盖。</div>
+</a>
+
+<a class="card" href="05-llm适配器与流式词汇详解.html">
+  <div class="num">第 05 篇 · llm/llm</div>
+  <div class="title">适配器注册表与流式词汇</div>
+  <div class="desc">LlmAdapter 抽象（唯一必须实现 stream）、三张注册表（adapters/directory/discoveries）、llm/stream 瀑布、prepareCall 的"绑定一代"语义、ContentBlock 词汇、BlockAssembler 单一组装算法、无损流记录。12 个文件覆盖。附五包系列回顾。</div>
+</a>
+
+<h2>阅读顺序建议</h2>
+<ol>
+  <li>先读 01 建立全局图景（约 20 分钟）</li>
+  <li>02 → 05 按依赖顺序逐包深入；每篇开头标了覆盖的包与行数</li>
+  <li>对照源码阅读体验最佳：<code>packages/core/&lt;pkg&gt;/src/</code> 下按文档顺序打开文件</li>
+</ol>
+
+<h2>本系列覆盖的核心包清单</h2>
+<table>
+  <tr><th>包</th><th>行数</th><th>讲解篇</th></tr>
+  <tr><td><code>core/scope</code></td><td>471</td><td>02</td></tr>
+  <tr><td><code>core/session</code></td><td>3490</td><td>02</td></tr>
+  <tr><td><code>core/system-prompt</code></td><td>700</td><td>03</td></tr>
+  <tr><td><code>core/tools</code></td><td>3797</td><td>03</td></tr>
+  <tr><td><code>core/agent</code></td><td>1802</td><td>04</td></tr>
+  <tr><td><code>core/agent-loop</code></td><td>2155</td><td>04</td></tr>
+  <tr><td><code>llm/llm</code></td><td>4086</td><td>05</td></tr>
+  <tr><td>其余（agent-default-model / tool-executor-* / ptc）</td><td>1838</td><td>暂未覆盖（外围件）</td></tr>
+</table>
+
+<footer>
+MyDSH 架构讲解系列 · 索引 · 本目录（<code>mydocs/architecture/</code>）为个人定制文档，与上游 <code>docs/</code> 相互独立 · 另见 <a href="../公司内网编译运行配置指南.html">公司内网编译运行配置指南</a>
+</footer>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MyDSH 架构详解 02 — scope 与 session：作用域原语和事件溯源日志</title>
+<style>
+  :root { --fg:#1f2328; --muted:#59636e; --border:#d1d9e0; --bg-soft:#f6f8fa; --code-bg:#f6f8fa; --accent:#0969da; --warn-bg:#fff8c5; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:32px 16px 64px; font-family:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif; font-size:15px; line-height:1.75; color:var(--fg); background:#fff; }
+  main { max-width:980px; margin:0 auto; }
+  h1 { font-size:1.9em; border-bottom:1px solid var(--border); padding-bottom:.35em; }
+  h2 { font-size:1.35em; border-bottom:1px solid var(--border); padding-bottom:.3em; margin-top:2.2em; }
+  h3 { font-size:1.12em; margin-top:1.7em; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  code { font-family:Consolas,"Courier New",monospace; font-size:.92em; background:var(--code-bg); border:1px solid var(--border); border-radius:4px; padding:.12em .35em; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:6px; padding:12px 14px; overflow-x:auto; line-height:1.55; }
+  pre code { background:none; border:none; padding:0; font-size:.88em; }
+  table { border-collapse:collapse; width:100%; margin:1em 0; display:block; overflow-x:auto; }
+  th,td { border:1px solid var(--border); padding:6px 12px; text-align:left; vertical-align:top; }
+  th { background:var(--bg-soft); }
+  blockquote { margin:1em 0; padding:.5em 1.1em; border-left:4px solid var(--accent); background:var(--bg-soft); }
+  .analogy { margin:1.2em 0; padding:.6em 1.1em; border-left:4px solid #bf8700; background:var(--warn-bg); border-radius:0 6px 6px 0; }
+  .analogy::before { content:"🐹 类比 · "; font-weight:700; color:#7d5900; }
+  ul,ol { padding-left:1.6em; } li { margin:.3em 0; }
+  .toc { background:var(--bg-soft); border:1px solid var(--border); border-radius:6px; padding:12px 20px; }
+  .toc ul { padding-left:1.2em; margin:.3em 0; }
+  footer { margin-top:3em; color:var(--muted); font-size:.9em; border-top:1px solid var(--border); padding-top:1em; }
+  .series { display:inline-block; background:var(--bg-soft); border:1px solid var(--border); border-radius:999px; padding:2px 12px; font-size:.88em; color:var(--muted); margin-bottom:1em; }
+  .filecard { border:1px solid var(--border); border-radius:8px; padding:10px 16px; margin:1em 0; background:var(--bg-soft); }
+  .filecard .path { font-family:Consolas,monospace; font-weight:700; color:#0550ae; }
+  .filecard .lines { float:right; color:var(--muted); font-size:.88em; }
+</style>
+</head>
+<body>
+<main>
+
+<span class="series">MyDSH 架构讲解 · 第 02 篇 · <a href="index.html">返回索引</a></span>
+<h1>scope 与 session：作用域原语和事件溯源日志</h1>
+
+<p>本篇开始逐文件讲解核心代码。覆盖两个基础包：</p>
+<ul>
+  <li><code>packages/core/scope</code>（471 行）— 全部插件的<strong>作用域路由原语</strong></li>
+  <li><code>packages/core/session</code>（3490 行）— <strong>事件溯源的会话日志</strong>，整个系统的"数据库"</li>
+</ul>
+
+<nav class="toc">
+<strong>目录</strong>
+<ul>
+  <li><a href="#scope">一、core/scope（2 个文件）</a></li>
+  <li><a href="#session-types">二、session/types.ts — 词汇表（一切类型的定义处）</a></li>
+  <li><a href="#session-index">三、session/index.ts — Session 与 SessionStore</a></li>
+  <li><a href="#session-surface">四、session/surface.ts — 模型可见表面</a></li>
+  <li><a href="#session-small">五、session 的五个小文件</a></li>
+  <li><a href="#summary">六、本篇要点回顾</a></li>
+</ul>
+</nav>
+
+<h2 id="scope">一、core/scope — 作用域原语（471 行）</h2>
+
+<p>解决的问题：<strong>多个 agent 并存时，事件和注册表如何按 agent 隔离，又能继承？</strong> 比如 UI 想监听"所有 agent 的事件"，而某个 agent 的守卫只想看自己的事件。Cordis 本身不知道 agent 是什么——这个包提供纯粹的、领域无关的作用域机制。</p>
+
+<div class="filecard"><span class="lines">204 行</span><span class="path">index.ts</span> — 作用域的铸造与事件路由</div>
+
+<h3>ScopeKey：不透明的身份</h3>
+<pre><code>export type ScopeKey = object</code></pre>
+<p>作用域的 key 就是<strong>任意对象</strong>——身份即地址，不做字符串化。谁创建谁知道，机制本身不关心它代表"一个 agent"还是"一次任务"。</p>
+<div class="analogy">
+JS 里 <code>object</code> 身份比较 ≈ Kotlin 的 <code>Any?</code> 引用相等（<code>===</code>）或一个不重写 <code>equals</code> 的类：每个实例天然唯一。比字符串 key 安全——字符串会撞名、会被枚举，对象引用不会。等价于 Java 里用 <code>enum</code> 实例或 <code>AtomicReference</code> 当 Map key。
+</div>
+
+<h3>createScope：铸造一个作用域</h3>
+<pre><code>export function createScope(ctx: Context, key: ScopeKey, options?): Scope {
+  const fiber = ctx.plugin(scope)               // ① 挂一个空插件 = 私有 fiber
+  const scoped: Context = fiber.ctx.extend({ [kScope]: key })  // ② 给 ctx 打上作用域标签
+  return { ctx: scoped, rawDispose: fiber.dispose, dispose: ... }
+}</code></pre>
+<p>三步曲：① 在父 ctx 下挂一个<strong>空函数插件</strong>（<code>function scope() {}</code>）——Cordis 的 fiber 天然是一个可整体卸载的所有权单元；② <code>extend</code> 出一个携带作用域标签的派生 ctx——之后<strong>所有经这个 ctx 做的注册，读取时都能问出"我属于哪个作用域"</strong>（<code>scopeOf(ctx)</code> 沿原型链读到 <code>[kScope]</code>）；③ 返回 dispose，卸载即撤销该作用域内的一切注册。</p>
+<div class="analogy">
+<code>ctx.plugin(scope)</code> ≈ 协程里的 <code>CoroutineScope(Job(parent))</code>：空插件就是空 Job——不执行任何逻辑，只充当<strong>所有权锚点</strong>；<code>dispose()</code> ≈ <code>job.cancel()</code> 及其后的传播。携带标签的派生 ctx ≈ <code>coroutineContext + CoroutineName(element)</code>：上下文元素沿链可查。
+</div>
+
+<h3>bindScopeParent / scopeChainOf：作用域链</h3>
+<p>子作用域绑父作用域（有环检测、绑定一次后只有拿到 <code>ScopeParentBinding</code> 的原始绑定者才能 rebind）。链只有两个消费者，方向刚好相反：</p>
+<ul>
+  <li><strong>注册表向下继承</strong>（store.ts 的 <code>chainLayers</code>）：子作用域能看到祖先的注册层</li>
+  <li><strong>事件向上冒泡</strong>（<code>scopeTarget</code> 的 filter）：发给后代作用域的事件，祖先作用域的监听者也能收到</li>
+</ul>
+<div class="analogy">
+事件向上冒泡 = <strong>Android 的触摸事件/Flutter 的事件冒泡</strong>反过来的注册表语义；更准确的统一心智模型是 <strong>DOM 的 event bubbling + CSS 级联</strong>：样式（注册）沿继承链向下生效，事件沿树向上传播。rebind 的权限设计类似 <code>SharedPreferences.edit()</code> 返回编辑器句柄——能力即对象。
+</div>
+
+<h3>scopeTarget：路由型事件载体</h3>
+<p>给一个对象（如 Session）生成一个"代理监听目标"。Cordis 派发事件时会调用载体上的 <code>[Context.filter]</code> 谓词来决定某个监听者的 ctx 是否该收到：未打作用域标签的监听者<strong>全局收</strong>；打了标签的，只有 key 等于分发目标、或目标是其<strong>祖先</strong>时才收。<strong>事件只上不下</strong>。</p>
+
+<div class="filecard"><span class="lines">267 行</span><span class="path">store.ts</span> — 作用域感知注册表的三件套</div>
+<ul>
+  <li><code>NamedEntries&lt;V&gt;</code>：按名唯一注册（重名抛错），插入序，<code>insert()</code> 返回幂等的撤销函数</li>
+  <li><code>AnonymousEntries&lt;V&gt;</code>：匿名追加（同值算多条），<code>append()</code> 同样返回撤销</li>
+  <li><code>ScopedLayers&lt;L&gt;</code>：注册表的"全局层 + 各作用域覆盖层"容器</li>
+</ul>
+<p><code>ScopedLayers</code> 的三个读法体现了精确的语义切割：</p>
+<ul>
+  <li><code>peek(scope)</code>：只看<strong>本作用域自己的</strong>层——文档强调"chain-blind"，防止"自己的守卫设置悄悄混入祖先的"</li>
+  <li><code>chainLayers(scope)</code>：沿链向上收集（祖先在前、自己在后，<strong>后者最终生效</strong>）</li>
+  <li><code>merge(scope, pick)</code>：按名合并出有效视图——近者覆盖远者</li>
+</ul>
+<p><code>effect(ctx, action)</code> 把"往哪层写"和"写归谁清理"合并成一个决定：从 <code>scopeOf(ctx)</code> 读作用域，注册进对应层，撤销函数挂进 <code>ctx.effect()</code>——<strong>插件卸载 = 层清空 = 层对象回收</strong>，全部自动。</p>
+<div class="analogy">
+<code>ScopedLayers.merge</code> = CSS specificity 的简化版：全局样式表 + 各级 override，近处赢。<code>NamedEntries</code> 的幂等撤销函数 ≈ Kotlin <code>MutableMap</code> + 返回的 <code>AutoCloseable</code>；整套层随插件 fiber 卸载而消失，再次对应结构化并发"作用域即生命周期"。
+</div>
+
+<h2 id="session-types">二、session/types.ts — 词汇表（578 行）</h2>
+<p>整个 session 包乃至整个系统的类型地基。逐块讲：</p>
+
+<h3>1. 品牌化标量（Branded types）</h3>
+<pre><code>export type SessionId = Branded&lt;'SessionId'&gt;      // 一个字符串，但类型上不等于 string
+export type SessionSeq = BrandedNumber&lt;'SessionSeq'&gt;  // 一个数字，但类型上不等于 number</code></pre>
+<p><code>SessionSeq(42)</code> 构造时校验"非负安全整数"，-0 都拒绝。仓库规则"跨边界的 opaque id 必须品牌化"防止的就是把工具调用的 seq 当会话偏移量用这类事故。</p>
+<div class="analogy">
+= Kotlin 的 <code>@JvmInline value class SessionId(val raw: String)</code> 或 Java record 包装，但零运行时成本（纯类型层）。构造函数里的校验 ≈ <code>init { require(...) }</code>。
+</div>
+
+<h3>2. SESSION_FORMAT_VERSION 与 SessionHeader</h3>
+<p><code>SESSION_FORMAT_VERSION = 4</code> 是<strong>单调整数</strong>（无 major/minor），盖进每个新写日志的 header。升级规则极其克制：只有"现有判别器无法防止不安全解读"才 bump；未知事件类型由 <code>ignorable</code> 标记治理（见下）。<code>SessionHeader</code> 存<strong>日志之外</strong>的元数据：cwd、fork 血缘（parentSession/isSeeded）、子代理深度（delegationDepth，持久化以便重启后预算不重置）、agentPreset（持久化以防恢复出模型无法操作的组合）。</p>
+<div class="analogy">
+= Android 的 <code>DatabaseInfo</code> 版本号 + Room Migration 链，或 protobuf 的 schema 版本。<code>ignorable</code> 标记的设计哲学很值得抄：默认"未知=拒绝重建"（宁可过严不可瞎猜），作者显式标注"丢了也不影响解读"才允许跳过——<strong>故障模式偏向 fail-loud 而非 fail-silent</strong>。
+</div>
+
+<h3>3. SessionEventMap — 事件表（核心！）</h3>
+<table>
+  <tr><th>事件</th><th>含义</th><th>类别</th></tr>
+  <tr><td><code>turn/start / turn/end</code></td><td>轮次边界；end 携带 <code>TurnEndReason</code>（completed/aborted/blocked/error/max-tokens/interrupted/forked）</td><td>边界</td></tr>
+  <tr><td><code>step/start / step/end</code></td><td>步骤边界（一次模型调用+其工具）</td><td>边界</td></tr>
+  <tr><td><code>user/message</code></td><td>用户输入；三种来源（真人/agent.inject 注入上下文/goal 续轮）<strong>都逐字进模型</strong>，靠 <code>source</code> 区分</td><td>表面</td></tr>
+  <tr><td><code>developer/message</code></td><td>增量工具增删声明，靠 <code>headerSeq</code> 引用历史 header 里的完整定义</td><td>表面</td></tr>
+  <tr><td><code>system/message</code></td><td>渲染后的系统提示（表面节点 0），支持原地替换和归一化</td><td>表面</td></tr>
+  <tr><td><code>assistant/message</code></td><td>成型的助手消息：内嵌<strong>精确压缩流</strong> + usage + interrupted 标记</td><td>表面</td></tr>
+  <tr><td><code>assistant/attempt</code></td><td>未成型消息的尝试（失败/重试/取消），保流不保历史——<strong>不伪造模型可见历史</strong></td><td>留痕</td></tr>
+  <tr><td><code>tool/call / tool/result</code></td><td>工具请求与结果；arguments 是<strong>未解析的原始 JSON 字符串</strong>（模型怎么写就怎么存）</td><td>表面/留痕</td></tr>
+  <tr><td><code>request/header</code></td><td>请求完整头快照（config+tools），最新一条重建请求头</td><td>仅日志</td></tr>
+  <tr><td><code>request/context</code></td><td>路由元数据（provider/model/上下文窗口），只在变化时记</td><td>仅日志</td></tr>
+  <tr><td><code>session/end-seed</code></td><td>fork 继承前缀的切割标记（只有构造器和 buildForkSeed 可写）</td><td>仅日志</td></tr>
+</table>
+<p>三个精妙设计：</p>
+<ul>
+  <li><strong>SurfaceOp 是条件字段</strong>：<code>SessionEvent</code> 是 discriminated union——只有五类"消息生产事件"能带 <code>surfaceOp</code>/<code>sourceEventSeqs</code>，编译器在 <code>Session.append()</code> 调用点强制。表面事件必须声明自己如何进入表面：<code>'append'</code>（追加到尾）或 <code>{op:'replace', startSeq, endSeq}</code>（替换一段范围——压缩用）。</li>
+  <li><strong>ignorable 只治理未知类型</strong>，不治理任意嵌套字段变化——嵌套变化的兼容性要靠"同版本读者保留旧表示"的发布纪律。</li>
+  <li><strong>PluginRecordMap</strong>：实验插件用 <code>plugin:xxx/yyy</code> 命名空间记日志外事件，类型声明的合并不进入已发布的持久化 schema。</li>
+</ul>
+
+<h2 id="session-index">三、session/index.ts — Session 与 SessionStore（1555 行）</h2>
+<p>两个角色：<code>Session</code>（一个事件溯源的聚合，普通类）与 <code>SessionStore</code>（Cordis Service，<code>ctx.sessions</code>）。</p>
+
+<h3>Session 类：日志 + 四个增量 fold 缓存</h3>
+<pre><code>session.append(type, data, ...surfaceOpts)   // 追加（单事件或批量）
+session.surface          // SurfaceManager（表面视图）
+session.requestHeader()  // fold request/header 事件 → EpochHeader（增量，O(新事件)）
+session.requestContext() // fold request/context
+session.toolHistory()    // fold header+developer 消息 → 工具史
+session.deriveMessages() // 表面 → Message[]（模型历史！）</code></pre>
+<p><code>append</code> 是全系统最热的写入路径，安全措施层层叠：</p>
+<ol>
+  <li><code>snapshotAppend</code>：<strong>一次迭代</strong>完成 读取+校验+拷贝（"有状态的 getter 不能给校验一个值、给存储另一个值"）；非 JSON 可序列化（BigInt/循环引用/Date/Map…）当场拒绝</li>
+  <li><code>createAppendEvent</code>：深冻结，<code>seq = log.length</code>（全系统依赖的<strong>连续性契约</strong>）</li>
+  <li><code>surfaceManager.validateNext</code>：表面转移合法性（见下节）</li>
+  <li><code>commit</code>：推入日志 → 立即同步派发 <code>session/event</code>（观察者失败被<strong>逐个圈禁</strong>，不影响已提交事实）</li>
+</ol>
+<p>批量 <code>#appendEvents</code> 更讲究：所有候选<strong>先全部验证</strong>、监听者快照先解析（防监听者变更中途生效）、然后一次性提交——要么全进要么全不进。持久化是<strong>插件的事</strong>：持久化插件订阅 <code>session/event</code> 异步缓冲，<code>session/flush</code>（store 的方法，await 所有监听者）是持久化检查点——热路径永不阻塞在 I/O。</p>
+<div class="analogy">
+Session ≈ <strong>EventStore + Aggregate</strong>（CQRS/Event Sourcing 的聚合根）。四个 fold 缓存 = <code>@Transient</code> 的投影缓存：日志是唯一真相，<code>requestHeader()/toolHistory()/deriveMessages()</code> 都是从日志折叠的<strong>物化视图</strong>，只在读时增量更新。批量 append 的"先全验后全提" = 数据库事务批量提交；监听者圈禁 = RxJava <code>onErrorContinue</code> / 协程 <code>supervisorScope</code> 的"子失败不传染兄弟"。
+</div>
+
+<h3>创建/进场/宣布：prepare → enter → announce</h3>
+<p>这不是过度设计——注释讲得很清楚：agent-loop 需要把<strong>会话生命周期折叠进 agent 自己的同一个 effect</strong>，让"agent 卸载"按顺序先发布完驱动器的收尾事件、再撤会话。三段式：</p>
+<ul>
+  <li><code>prepare</code>：构建未入店的 Session（只读）</li>
+  <li><code>enter</code>：装入 store + 安装发布钩子，返回 detach——<strong>先不广播</strong></li>
+  <li><code>announce</code>：广播 <code>session/created</code>——调用方先把 detach yield 进自己的 effect 再 announce，这样<strong>同步抛出的 created 监听者会回滚整个进场</strong>而不泄漏</li>
+</ul>
+<p>便捷版 <code>create()</code> = 三连。另有防护：append 不可重入（<code>entry.appending</code> 期间再来直接拒绝）；在 created 派发完成前禁止追加；enter 后重查 id 冲突（防"prepare 后被人插队"）。</p>
+<div class="analogy">
+这是<strong>两阶段提交的构造学版本</strong>：先登记（enter），后对外官宣（announce），官宣失败回滚登记。对应 Kotlin 里 <code>val scope = CoroutineScope(SupervisorJob())</code> 后、注册 listener 前先 <code>try</selig>……不，更准确地：像 Spring 的 <code>ApplicationEventPublisher</code> + <code>@Transactional</code> 的 afterCommit 语义分离——"状态生效"与"事件广播"是两个可分别失败的阶段，必须能原子回滚。
+</div>
+
+<h3>fork：从一个存活会话的精确边界开分支</h3>
+<p><code>fork(source, boundary?, childId?)</code>：拷贝 [0..boundary] 前缀 → 追加 <code>session/end-seed {inherited:true}</code> 标记切割点 → 用 <code>openTurnClosers</code>（repair.ts）给<strong>悬空的工具调用补合成错误结果</strong>（结果文案教模型"只读/幂等才重试"）→ 关开着的 step/turn（<code>reason: forked</code>）。<code>inheritedEventCount</code> 只数拷贝来的事件，合成的关闭器不算继承。</p>
+
+<h2 id="session-surface">四、session/surface.ts — 模型可见表面（758 行）</h2>
+<p>本包最核心的抽象。<strong>日志 ≠ 模型历史</strong>：日志里全是事实（尝试、失败、边界、插件记录），但只有五类消息事件上"表面"。表面是一个<strong>有序的 seq 序列</strong>，由每个表面事件自带的 <code>surfaceOp</code> 翻折出来：</p>
+<pre><code>append:  nodes.push(seq)                        // 尾部追加
+replace: nodes.splice(startIdx, len, seq)       // 区间替换（压缩的机制基础）
+project: projectedMessages.set(seq, message)   // 插件投影改写既有内容（如 image/offload）</code></pre>
+<p><strong>计划/应用分离</strong>是这里的主旋律：<code>planSurfaceEvent</code>（纯校验，产出计划）与 <code>applySurfacePlan</code>（提交变更）分开；<code>SurfaceManager.validateNext</code> 先验证候选但不改状态，事件真进日志才应用计划——<strong>失败永远不会留下半改状态</strong>。</p>
+<p>校验规则体现了大量实战教训（每条规则都有事故背景）：</p>
+<ul>
+  <li><code>sourceEventSeqs</code> 必须引用更早的事件、不得重复、且 <strong>replace 必须引用所有被遮蔽节点</strong>（否则替换来源无法追溯）</li>
+  <li>tool/result 的 replace <strong>只许改 content</strong>（其余字段全等才放行）</li>
+  <li>表面节点 0（系统提示）的替换必须也是 system/message 且<strong>恰好只盖那一个节点</strong></li>
+  <li><code>isAppendSurfaceEvent</code> 的区分服务<strong>人类可读的转录</strong>：替换副本是"模型专用"的（压缩落地会抹掉用户已看过的对话），append 原件才是人类转录的原料——一个 API 同时服务两种读者</li>
+</ul>
+<div class="analogy">
+表面 = <strong>git 的分支视图</strong>：日志是 commit 链（append-only 全量事实），表面是"当前检出的树"（rebase/压缩后的有效状态）。<code>surfaceOp: replace</code> ≈ interactive rebase 的 squash——不删任何 commit（历史事件全在），但有效视图里旧内容被新节点遮蔽。<code>contentGeneration</code> 计数器 ≈ 视图的 etag：变了就整重建派生缓存，没变就尾部增量。
+</div>
+
+<h2 id="session-small">五、session 的其余文件</h2>
+
+<div class="filecard"><span class="lines">73 行</span><span class="path">seq-ranges.ts</span> — 编解码 seq 区间（持久化传输用），纯工具，此处展开意义不大。</div>
+
+<div class="filecard"><span class="lines">92 行</span><span class="path">known-event-types.ts</span> — <strong>生成文件</strong>（gen-persistence-catalog.ts 产出，doc-sync 门禁校验新鲜度）。列出本构建认识的所有事件类型；读路径遇到未知类型时：有 <code>ignorable</code> 就跳过，没有就拒绝重建。</div>
+
+<div class="filecard"><span class="lines">49 行</span><span class="path">preparation.ts</span> — <code>SessionPreparation</code>：实现 JS 的 <code>Symbol.dispose</code>（ECMAScript 显式资源管理），把"未发布 Session 的提供方状态"包成 RAII 句柄：发布消耗状态后 dispose 变 no-op，未发布则释放。</div>
+<div class="analogy"><code>Symbol.dispose</code> = Kotlin/Java 的 <code>AutoCloseable</code> + <code>use { }</code>/<code>try-with-resources</code> 的 JS 版（<code>using</code> 语法）。</div>
+
+<div class="filecard"><span class="lines">211 行</span><span class="path">repair.ts</span> — 尾部修复。<code>ToolCallRecovery</code> 是一个小状态机：观察事件流，追踪"助手要了但没答"的工具调用；<code>results()</code> 为悬空调用合成<strong>保守的错误结果</strong>（文案明确教模型判断"只读/幂等才重试，有副作用先查外部状态"）。两个入口：崩溃恢复（<code>interrupted</code> 文案）/ fork 种子（<code>forked</code> 文案，提示"父会话可能在 fork 点之后完成了它"）。合成事件的时间戳复用最后一个真实事件——<strong>不发明未来时间</strong>。</div>
+
+<div class="filecard"><span class="lines">69 行</span><span class="path">request-header.ts</span> — <code>canonicalHeader</code>（空 tools 折叠为缺省——"canonical"意味着整个系统只有一个表示法）、<code>headerEquals</code>（逐字段比较，tools 用 JSON 串比较）、<code>foldRequestHeader</code>（离线折叠；Session.requestHeader 是它的增量版）。</div>
+
+<div class="filecard"><span class="lines">75 行</span><span class="path">tool-history.ts</span> — <code>ToolHistoryProjection</code>：折叠 header + developer 消息得到<strong>工具史</strong>（基线工具集 + 历次增删），供"支持工具增删能力的适配器"在请求里投影历史定义；遇到旧日志（header 无配对 updates）自动退化为"只给当前激活集"。</div>
+
+<div class="filecard"><span class="lines">30 行</span><span class="path">fork.ts</span> — <code>buildForkSeed</code>：切片 + 标记 + 调 repair 的 closeTurnClosers 收尾。fork 的全部魔力就这 30 行。</div>
+
+<h2 id="summary">六、本篇要点</h2>
+<ol>
+  <li><strong>scope</strong> 用 471 行解决"多 agent 隔离与继承"：注册表向下继承、事件向上冒泡、空插件当所有权锚点——全部建在 Cordis 的 fiber/ctx 上，没有发明新生命周期。</li>
+  <li><strong>session</strong> 是事件溯源的教科书实现：append-only 日志是唯一真相；表面/fold 缓存全是派生物；持久化是插件订阅，热路径零 I/O。</li>
+  <li>处处<strong>计划先行、失败无痕</strong>：先验证再提交、批量要么全进要么全不进、校验用一次迭代防止 TOCTOU。</li>
+  <li>兼容性治理成体系：版本号单调、未知类型必须 ignorable、canonical 形式唯一、repair 的合成事件连时间戳都不发明。</li>
+</ol>
+
+<footer>
+MyDSH 架构讲解系列 · 第 02 篇 · <a href="index.html">返回索引</a> · 源码位置：<code>packages/core/scope</code>、<code>packages/core/session</code>
+</footer>
+
+</main>
+</body>
+</html>
