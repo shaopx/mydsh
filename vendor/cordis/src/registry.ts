@@ -301,8 +301,17 @@ export class RegistryService {
     return this.plugin({ inject, apply: callback, name: callback.name })
   }
 
-  /**
-   * Start a plugin in the current context and return its fiber.
+/*
+ * 学习：plugin() 是唯一的启动入口。
+ * resolve() 把函数、类、{ apply } 收成同一个 callback。注册表以 callback 为键，
+ * 同一个插件只有一条 Runtime，每次 plugin() 新建一条 Fiber 放进 runtime.fibers。
+ * inject 在这里收成纯对象，真正等待发生在 Fiber 构造函数末尾的 _refresh。
+ * 返回值被挂上 then，所以 await ctx.plugin(...) 等的是 fiber.await()，不是构造函数返回。
+ * 详见 docs/learn/cordis-from-zero.html#plugin
+ */
+
+/**
+ * Start a plugin in the current context and return its fiber.
    *
    * Creates (or reuses) the plugin's runtime record, then starts a new fiber
    * under the current context. Throws if `plugin` is not a supported shape or

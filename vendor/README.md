@@ -26,7 +26,9 @@ Intentionally **not** vendored (verified unused by this set): `reggol`, `@cordis
 
 ## Local modifications
 
-Keep this log exhaustive — every divergence from upstream must be listed. Each entry has a stable ID: remove an entry when its divergence no longer exists, and never renumber or reuse IDs. The next new entry is V31.
+Keep this log exhaustive — every divergence from upstream must be listed. Each entry has a stable ID: remove an entry when its divergence no longer exists, and never renumber or reuse IDs. The next new entry is V32.
+
+- **V31 · Cordis core learning comments**: Chinese block comments in `cordis/src/context.ts`, `service.ts`, `fiber.ts`, `events.ts`, and `registry.ts` mark the proxy, service registration, fiber epoch state machine, five dispatch modes, and `plugin()` identity. They point at `docs/learn/cordis-from-zero.html`. Comment-only; no runtime change.
 
 - **V1 · `hmr/src/index.ts`**: removed the `./locales/en-US.yml` / `./locales/zh-CN.yml` imports, the `.i18n({...})` call on the `Config` schema, and the `src/locales/` directory. Rationale: those imports require a runtime YAML loader hook (`@cordisjs/unyaml`) that we do not vendor; the i18n texts only localize config descriptions.
 - **V2 · All `package.json` files**: regenerated for Harness releases with scoped names, release versions, publication metadata, precise bundled-runtime and `lib/types/**/*.d.ts` / `.d.ts.map` file entries, source exports where applicable, and declaration metadata pointing at `lib/types`. References within the vendored set use `workspace:~`. HMR declares `esbuild` as a direct dev dependency for its imported `BuildFailure` type, Loader requires `node-addon-require-builtin@^0.1.4` to match published app runtimes, and Include declares `yaml@^2.9.0` instead of upstream's `^2.9.1` so the workspace installs one copy of `yaml`.

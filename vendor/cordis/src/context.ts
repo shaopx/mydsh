@@ -32,6 +32,17 @@ export interface Context {
   registry: RegistryService
 }
 
+/*
+ * 学习：Context 是服务表，运行时被 Proxy 包住。
+ * 读 ctx.tools 不会读到一个普通字段，而是进入 ReflectService，按当前 isolate 标签找实现。
+ * extend() 用原型链做出子上下文，父对象不变。isolate() 只换某一个服务名的标签。
+ * intercept() 不换实现，只给这个名字叠一层元数据。
+ * 构造顺序不能颠倒：先造代理和根 Fiber（runtime 为 null，所以根 fiber 一开始就是 ACTIVE），
+ * 再安装 reflect、registry、events、logger。这些内置服务在构造时把自己 provide 到上下文上。
+ * 最后清掉安装过程收进来的临时 disposer，并返回代理而不是裸对象。
+ * 详见 docs/learn/cordis-from-zero.html
+ */
+
 /**
  * Root and child dependency containers for Cordis plugins.
  *

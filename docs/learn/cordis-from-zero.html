@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>从零读懂 Cordis 核心</title>
+<style>
+  :root {
+    --bg: #f7f6f3;
+    --paper: #fff;
+    --ink: #1c1917;
+    --muted: #57534e;
+    --line: #e7e5e4;
+    --accent: #1d4ed8;
+    --code: #f5f5f4;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    color: var(--ink);
+    background: var(--bg);
+    font: 17px/1.65 "Iowan Old Style", Palatino, "Songti SC", serif;
+  }
+  header, main { max-width: 820px; margin: 0 auto; padding: 32px 24px; }
+  header { padding-bottom: 0; }
+  h1 { font-size: 34px; line-height: 1.2; margin: 0 0 12px; letter-spacing: -0.02em; }
+  h2 { font-size: 24px; margin: 48px 0 12px; }
+  h3 { font-size: 18px; margin: 28px 0 8px; }
+  p, li { color: var(--ink); }
+  .lede { font-size: 19px; color: var(--muted); }
+  nav {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    padding: 16px 20px;
+    margin: 24px 0;
+  }
+  nav ol { margin: 8px 0 0; padding-left: 20px; }
+  a { color: var(--accent); }
+  code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 14px; }
+  code { background: var(--code); padding: 1px 4px; }
+  pre {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    padding: 14px 16px;
+    overflow: auto;
+    line-height: 1.5;
+  }
+  table { width: 100%; border-collapse: collapse; background: var(--paper); margin: 16px 0; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: #fafaf9; font-weight: 600; }
+  .note { border-left: 3px solid var(--accent); padding: 8px 14px; background: var(--paper); }
+  footer { max-width: 820px; margin: 0 auto; padding: 0 24px 48px; color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>从零读懂 Cordis 核心</h1>
+  <p class="lede">这份讲义对应仓库里的 <code>vendor/cordis/src</code>。Cordis 是 DeepSeek Harness 的插件内核：模型、工具、会话和代理循环都是挂在它上面的插件。读完这份讲义，你应该能自己走通一次 <code>new Context()</code>、一次 <code>ctx.plugin()</code>，以及一次事件分发。</p>
+</header>
+<main>
+<nav>
+  <strong>阅读顺序</strong>
+  <ol>
+    <li><a href="#problem">它解决什么问题</a></li>
+    <li><a href="#objects">五个对象</a></li>
+    <li><a href="#boot">new Context() 实际做了什么</a></li>
+    <li><a href="#plugin">插件的三种写法</a></li>
+    <li><a href="#states">Fiber 状态机</a></li>
+    <li><a href="#inject">依赖是怎么等待的</a></li>
+    <li><a href="#effect">effect 和卸载顺序</a></li>
+    <li><a href="#events">五种事件</a></li>
+    <li><a href="#scope">isolate 和 intercept</a></li>
+    <li><a href="#harness">和 Harness 的关系</a></li>
+    <li><a href="#read">按文件精读</a></li>
+    <li><a href="#exercise">自己做一遍</a></li>
+  </ol>
+</nav>
+
+<h2 id="problem">它解决什么问题</h2>
+<p>一个代理程序会不断加上新能力：换模型、加工具、记日志、热更新配置。如果每个能力都互相 import 具体类，加载顺序和卸载顺序会缠在一起。Cordis 把这些能力拆成插件。插件不寻找对方的类，只声明“我需要名叫 <code>tools</code> 的服务”，以及“我提供名叫 <code>counter</code> 的服务”。框架负责：</p>
+<ul>
+  <li>等依赖到齐再执行插件函数。</li>
+  <li>依赖消失时先停掉使用者，再拆掉提供者。</li>
+  <li>插件里登记的监听和定时器，随插件一起撤销。</li>
+  <li>用事件让旁路逻辑包住原有逻辑，而不改原函数。</li>
+</ul>
+<p class="note">源码在 <code>vendor/cordis/src</code>。它是从上游 Cordis <code>v4.0.0-rc.12</code> 拷进来的，并有本地修改。学习时以这份源码为准，不要只看上游文档。</p>
+
+<h2 id="objects">五个对象</h2>
+<table>
+  <thead><tr><th>对象</th><th>文件</th><th>你把它当成什么</th></tr></thead>
+  <tbody>
+    <tr><td><code>Context</code></td><td><code>context.ts</code></td><td>一张服务表。写 <code>ctx.tools</code> 就是按名字取服务。</td></tr>
+    <tr><td><code>Service</code></td><td><code>service.ts</code></td><td>往这张表里登记自己的基类。<code>super(ctx, 'counter')</code> 之后，<code>ctx.counter</code> 就是这个实例。</td></tr>
+    <tr><td><code>Fiber</code></td><td><code>fiber.ts</code></td><td>一次插件运行。它有状态、配置、依赖快照，以及一份必须撤销的登记清单。</td></tr>
+    <tr><td><code>RegistryService</code></td><td><code>registry.ts</code></td><td><code>ctx.plugin()</code> 的实现。它认出函数、类和 <code>{ apply }</code> 三种插件。</td></tr>
+    <tr><td><code>EventsService</code></td><td><code>events.ts</code></td><td>事件总线。<code>ctx.on</code>、<code>ctx.emit</code>、<code>ctx.waterfall</code> 都转发到它。</td></tr>
+  </tbody>
+</table>
+<p>还有两个配角。<code>ReflectService</code>（<code>reflect.ts</code>）是 <code>Context</code> 代理的真正读写逻辑：属性访问会变成服务查找。<code>LoggerService</code>（<code>logger.ts</code>）提供 <code>ctx.logger</code>。</p>
+<pre>Context（代理）
+  ├─ fiber        这次插件运行
+  ├─ reflect      ctx.foo 的查找和登记
+  ├─ registry     ctx.plugin / ctx.inject
+  ├─ events       ctx.on / ctx.emit / ctx.waterfall
+  └─ logger       ctx.logger(name)</pre>
+
+<h2 id="boot">new Context() 实际做了什么</h2>
+<p>构造函数在 <code>context.ts</code>。顺序是固定的，颠倒就会在安装内置服务时找不到根 fiber。</p>
+<ol>
+  <li>创建空的隔离表 <code>symbols.isolate</code> 和拦截表 <code>symbols.intercept</code>。用 <code>Object.create(null)</code>，避免继承 <code>Object.prototype</code> 上的名字。</li>
+  <li>用 <code>Proxy</code> 包住自己，handler 是 <code>ReflectService.handler</code>。从此 <code>ctx.tools</code> 不再是普通字段，而是一次服务查找。</li>
+  <li><code>this[symbols.root] = self</code>。所有子上下文都指向同一个根。</li>
+  <li><code>new Fiber(self, {}, Object.create(null), null, () =&gt; [])</code>。第四个参数 <code>runtime</code> 是 <code>null</code>，表示这是根 fiber：<code>uid</code> 为 0，状态直接是 <code>ACTIVE</code>，<code>dispose</code> 等于 <code>restart</code>。</li>
+  <li>依次 <code>new ReflectService</code>、<code>RegistryService</code>、<code>EventsService</code>、<code>LoggerService</code>。它们在构造时调用 <code>ctx.reflect.provide</code>，把自己登记成服务，再把方法混到 <code>ctx</code> 上，所以你能写 <code>ctx.plugin</code> 而不是 <code>ctx.registry.plugin</code>。</li>
+  <li>清掉根 fiber 在安装这些服务时收进来的临时 disposer，然后 <code>return self</code>。调用方拿到的是代理，不是裸对象。</li>
+</ol>
+<pre>const root = new Context()
+// root 是 Proxy
+// root.fiber.state === ACTIVE
+// root.plugin、root.on、root.logger 已经可用</pre>
+
+<h2 id="plugin">插件的三种写法</h2>
+<p><code>RegistryService.plugin()</code>（<code>registry.ts</code>）只接受三种形状，由 <code>resolve()</code> 归一成一个可调用的 <code>callback</code>：</p>
+<table>
+  <thead><tr><th>写法</th><th>调用方式</th></tr></thead>
+  <tbody>
+    <tr><td>函数 <code>(ctx, config) =&gt; {}</code></td><td>直接调用</td></tr>
+    <tr><td>类 <code>class X { constructor(ctx, config) {} }</code></td><td><code>new</code></td></tr>
+    <tr><td>对象 <code>{ apply(ctx, config) {} }</code></td><td>调用 <code>apply</code></td></tr>
+  </tbody>
+</table>
+<p>同一个 <code>callback</code> 在注册表里只有一条 <code>Plugin.Runtime</code>。每调用一次 <code>ctx.plugin()</code>，就新建一条 <code>Fiber</code>，放进 <code>runtime.fibers</code>。所以同一个插件类可以在不同上下文里各跑一份。</p>
+<p>函数和对象上可以挂：</p>
+<ul>
+  <li><code>inject</code>：必须先存在的服务名。数组表示只要服务；对象还可以带给该服务的拦截配置。</li>
+  <li><code>Config</code>：Standard Schema。启动前同步校验，不支持异步校验（<code>resolveConfig()</code> 会抛 <code>TypeError</code>）。</li>
+  <li><code>name</code>：诊断用的显示名。</li>
+</ul>
+<p><code>ctx.inject(deps, callback)</code> 只是 <code>ctx.plugin({ inject, apply: callback })</code> 的简写。依赖变化时，这个回调会卸掉再跑一遍。</p>
+
+<h2 id="states">Fiber 状态机</h2>
+<p>状态枚举在 <code>fiber.ts</code> 的 <code>FiberState</code>。真正决定状态的是 <code>_getState()</code> 和 <code>_updateState()</code>，不是到处手写赋值。</p>
+<table>
+  <thead><tr><th>状态</th><th>含义</th></tr></thead>
+  <tbody>
+    <tr><td><code>PENDING</code></td><td><code>inject</code> 里还有服务没到齐，插件函数还没跑。</td></tr>
+    <tr><td><code>LOADING</code></td><td>依赖刚到齐，正在执行插件函数。</td></tr>
+    <tr><td><code>ACTIVE</code></td><td>插件函数已返回。它 <code>provide</code> 的服务现在对别人可见。</td></tr>
+    <tr><td><code>UNLOADING</code></td><td>正在按相反顺序跑 disposer。提供者会等所有依赖者卸完才拆自己的 effect。</td></tr>
+    <tr><td><code>FAILED</code></td><td>插件函数或配置抛错。不会因为依赖后来到齐而自动重试，必须 <code>update()</code> 清掉错误。</td></tr>
+    <tr><td><code>DISPOSED</code></td><td><code>uid</code> 已清空。不能再 <code>effect()</code>、<code>restart()</code>。</td></tr>
+  </tbody>
+</table>
+<pre>PENDING ──依赖到齐──&gt; LOADING ──成功──&gt; ACTIVE
+   ^                      |                |
+   |                      └──抛错──&gt; FAILED │
+   |                                        │
+   └──────── UNLOADING &lt;──依赖消失或 dispose ┘</pre>
+<p>切换钥匙是 <code>epoch</code> 字符串，由 <code>_refresh()</code> 计算：</p>
+<pre>epoch = revision + ":" + 每个 inject 服务实现的 uid
+缺任何一个依赖 → epoch = "__INACTIVE__"</pre>
+<p><code>_setEpoch()</code> 比较新旧 epoch。从 <code>__INACTIVE__</code> 变成具体字符串，就 <code>_reload()</code>。从具体字符串变回 <code>__INACTIVE__</code> 或换成另一组依赖，就 <code>_unload()</code>。<code>inertia</code> 保存这次进行中的 Promise。加载过程中 epoch 又变了，这次加载的结果不能算数，会接着卸载。</p>
+<p>子 fiber 的构造顺序（<code>Fiber</code> 构造函数，<code>runtime</code> 非空时）值得按行读：</p>
+<ol>
+  <li><code>parent.extend({ fiber: this })</code> 做出插件自己的上下文。父上下文不被修改。</li>
+  <li>把 <code>dispose</code> 登记成父 fiber 的一个 effect。父插件卸载时，子插件一定跟着卸载。</li>
+  <li>然后才 <code>emit('internal/plugin')</code>。观察者如果在这个事件里同步 <code>dispose()</code>，父 effect 已经存在，卸载不会丢。</li>
+  <li>事件返回后才检查 <code>inject</code> 并 <code>_refresh()</code>。Loader 可以在 <code>internal/plugin</code> 里补上依赖，所以不能提前算 epoch。</li>
+</ol>
+
+<h2 id="inject">依赖是怎么等待的</h2>
+<p>插件声明 <code>inject: ['counter']</code> 时，<code>Inject.resolve</code> 把它收成 <code>{ counter: null }</code>。构造 fiber 时对每个名字调用 <code>_checkImpl</code>：</p>
+<ul>
+  <li>当前隔离范围里没有这个服务，或提供它的 fiber 不是 <code>ACTIVE</code>，就从 <code>_store</code> 删掉。</li>
+  <li>服务可以带 <code>check()</code>。返回假，也视为不可用。</li>
+  <li>全部都在 <code>_store</code> 里，epoch 才离开 <code>__INACTIVE__</code>，进入 <code>_reload()</code>。</li>
+</ul>
+<p><code>_reload()</code> 先把当前依赖记到 <code>committed</code>，并把自己加进对方的 <code>dependents</code>。然后执行插件函数。这样提供者卸载时知道还有谁在用它。</p>
+<p>服务要等本 fiber 变成 <code>ACTIVE</code> 才对别人可见。<code>_updateState()</code> 在进出 <code>ACTIVE</code> 时调用 <code>reflect.notify</code>，唤醒正在等待这些服务的 fiber。所以“A 提供 counter，B 注入 counter”不需要手写启动顺序：先 <code>plugin(B)</code> 再 <code>plugin(A)</code> 也可以，B 会停在 <code>PENDING</code>，直到 A 变成 <code>ACTIVE</code>。</p>
+
+<h2 id="effect">effect 和卸载顺序</h2>
+<p><code>ctx.effect(fn)</code>、<code>ctx.on(...)</code>、<code>ctx.provide(...)</code> 最终都进 <code>Fiber.effect()</code>。它立刻执行 <code>fn</code>。<code>fn</code> 可以返回：</p>
+<ul>
+  <li>一个清理函数。</li>
+  <li>一个解析成清理函数的 Promise。</li>
+  <li>一个同步或异步的可迭代对象，逐个产出清理函数。</li>
+</ul>
+<p>清理函数按登记的相反顺序执行。后登记的先撤，和括号配对一样。<code>effect()</code> 返回的函数本身也是清理函数：调用它只撤这一段；fiber 卸载时会撤全部。</p>
+<p>有两个容易漏掉的不变量，都写在 <code>effect()</code> 和 <code>_unload()</code> 里：</p>
+<ul>
+  <li>清理函数在 <code>execute()</code> 之前就挂进 fiber 的清单。插件函数执行到一半如果开始卸载，已经登记的部分仍会被收走。</li>
+  <li>提供者的 effect 要等 <code>provisions</code> 上的依赖者全部卸完才拆。依赖者卸载期间仍可以读到这个服务。这就是“先停使用者，再拆提供者”。</li>
+</ul>
+<p>fiber 已经 <code>DISPOSED</code> 或正处于 <code>UNLOADING</code> 时，再调用 <code>effect()</code> 会抛 <code>CordisError('INACTIVE_EFFECT')</code>。不能在拆的过程中再挂一块无人负责的登记。</p>
+
+<h2 id="events">五种事件</h2>
+<p>监听用 <code>ctx.on(name, listener)</code>。监听属于当前 fiber，fiber 卸载时自动移除。<code>prepend: true</code> 插到队首。<code>global: true</code> 不受上下文过滤。</p>
+<p><code>_resolve()</code> 在分发前做三件事：可选的第一个参数如果是对象或函数，就当成监听器的 <code>this</code>；取出事件名；按 <code>Context.filter</code> 丢掉不属于这个隔离范围的监听。服务上的 <code>[symbols.filter]</code> 比较的就是隔离标签，所以隔离出去的服务不会收到另一侧的事件。</p>
+<table>
+  <thead><tr><th>方法</th><th>等待</th><th>停止条件</th><th>适合</th></tr></thead>
+  <tbody>
+    <tr><td><code>emit</code></td><td>不等待，也不管返回的 Promise</td><td>全部同步跑完</td><td>通知。副作用不要依赖它的完成。</td></tr>
+    <tr><td><code>parallel</code></td><td><code>Promise.allSettled</code></td><td>全部结束后，如有拒绝就抛 <code>AggregateError</code></td><td>彼此无关的异步观察者。</td></tr>
+    <tr><td><code>serial</code></td><td>按顺序 <code>await</code></td><td>返回值不是 <code>null</code>、<code>false</code>、<code>undefined</code> 就停</td><td>有顺序的决策，可以提前结束。</td></tr>
+    <tr><td><code>bail</code></td><td>同步</td><td>和 serial 相同的“有值即停”</td><td>第一个处理者生效，例如 <code>internal/listener</code>。</td></tr>
+    <tr><td><code>waterfall</code></td><td>同步，由 <code>next()</code> 串联</td><td>不调用 <code>next()</code> 就截断后面的人和最内层实现</td><td>包住原行为：权限检查、改配置、改工具结果。</td></tr>
+  </tbody>
+</table>
+<p><code>waterfall</code> 的实现在 <code>events.ts</code>。最后一个参数被当成最内层的 <code>next</code>。监听器从外向内包起来。每个 <code>next</code> 只能调用一次，否则抛错。Harness 里工具执行前的 <code>tools/pre-execute</code> 就是这种：拒绝时不要调用 <code>next()</code>。</p>
+<pre>// 外层可以改结果，也可以直接返回而不调用 next
+ctx.on('demo', (value, next) =&gt; {
+  const inner = next()
+  return inner + 1
+})
+ctx.waterfall('demo', 1, () =&gt; 10) // 11</pre>
+<p>事件名通过 TypeScript 的声明合并加到 <code>Events</code> 接口上。分发方法的参数类型来自这个接口。名字写错会在编译期暴露，而不是运行到一半才发现。</p>
+
+<h2 id="scope">isolate 和 intercept</h2>
+<p><code>ctx.isolate('tools')</code> 返回一个子上下文。它复制一份隔离表，给 <code>tools</code> 一个新的 symbol 标签。在这个子树里 <code>provide('tools', ...)</code> 不会盖住父树的 <code>tools</code>。两个 <code>isolate</code> 如果传入同一个 label，就共享这一格。子树在自己提供 <code>tools</code> 之前，读取会失败，不会悄悄退回父插件注入的那份。</p>
+<p><code>ctx.intercept(name, config)</code> 不换实现，只往拦截表上叠一层元数据。<code>Service[symbols.resolveIntercept]</code> 的合并顺序是：先放当前 fiber 注入时带的配置，再从根到近处叠祖先的 intercept。默认合并是浅层 <code>Object.assign</code>，服务可以换成自己的合并函数。</p>
+<p><code>extend(meta)</code> 是上面两者的底座：子对象原型链指向父上下文，<code>meta</code> 的自有属性盖住父属性。父对象不变。</p>
+
+<h2 id="harness">和 Harness 的关系</h2>
+<p>Harness 启动时不是 <code>new</code> 一堆类，而是用 Loader 读 <code>cordis.yml</code> / <code>cordis.patch.yml</code>，对每一行调用等价于 <code>ctx.plugin(插件, config)</code>。因此：</p>
+<ul>
+  <li>代理循环、会话、文件系统、模型适配器都是插件，都可以被另一行配置替换。</li>
+  <li>业务逻辑应做成新插件，向 <code>ctx.tools</code> 登记工具，或监听 <code>tools/pre-execute</code>。不要改 <code>fiber.ts</code>。</li>
+  <li>模型能看见的事实还必须写入会话日志。那是 Harness 的规则，不是 Cordis 的规则。</li>
+</ul>
+
+<h2 id="read">按文件精读</h2>
+<p>建议的顺序和停留点：</p>
+<ol>
+  <li><code>context.ts</code> 全文。短，先建立“上下文是代理”的图像。看构造函数和 <code>extend</code> / <code>isolate</code> / <code>intercept</code>。</li>
+  <li><code>service.ts</code> 的构造函数和 <code>resolveIntercept</code>。理解 <code>super(ctx, name)</code> 为什么会让 <code>ctx[name]</code> 出现。</li>
+  <li><code>registry.ts</code> 的 <code>plugin()</code> 和 <code>Inject.resolve</code>。</li>
+  <li><code>fiber.ts</code> 的构造函数、<code>effect</code>、<code>_refresh</code>、<code>_setEpoch</code>、<code>_reload</code>、<code>_unload</code>。这是核心，值得读两遍。</li>
+  <li><code>events.ts</code> 的 <code>_resolve</code>、<code>waterfall</code>、<code>on</code>。</li>
+  <li><code>reflect.ts</code> 的 <code>provide</code> 和代理 handler。确认 <code>ctx.foo</code> 如何落到 store。</li>
+</ol>
+<p>源码里标有 <code>学习：</code> 的块注释和这份讲义对应，用来标出值得停下来的位置。原有 JSDoc 写的是调用契约，块注释写的是控制流为什么这样排。</p>
+
+<h2 id="exercise">自己做一遍</h2>
+<p>在一个小的 TypeScript 文件里只依赖 <code>@deepseek-ai/cordis</code>，不要启动整个 Harness：</p>
+<ol>
+  <li>写一个 <code>Counter extends Service</code>，<code>super(ctx, 'counter')</code>。</li>
+  <li>写一个函数插件，<code>inject: ['counter']</code>，在 <code>apply</code> 里 <code>ctx.on</code> 一个你自己声明合并进去的事件。</li>
+  <li>先 <code>plugin</code> 函数插件，再 <code>plugin</code> Counter。确认函数插件会等到 Counter 激活后才执行。可以在两边打日志看状态。</li>
+  <li>调用 <code>root.fiber.dispose()</code>，确认监听不再触发。</li>
+  <li>给函数插件的 <code>tools/pre-execute</code> 式瀑布加一个不调用 <code>next()</code> 的监听，确认内层没有运行。</li>
+</ol>
+<p>做完这五步，再去读 <code>packages/core/agent-loop</code>。那里的循环是 Cordis 的一个消费者，不是另一个内核。</p>
+</main>
+<footer>
+  源码位置：<code>vendor/cordis/src</code>。讲义只描述这份仓库里的实现，包括 fiber 卸载和 effect 的本地加固。
+</footer>
+</body>
+</html>

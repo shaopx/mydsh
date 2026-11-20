@@ -121,6 +121,18 @@ export interface Hook extends EventOptions {
   callback: (...args: any[]) => any
 }
 
+/*
+ * 学习：五种分发不要混用。
+ * emit 同步通知，不等待返回的 Promise。
+ * parallel 用 allSettled，全部结束后把拒绝收成 AggregateError。
+ * serial 按顺序 await，bail 同步按顺序走；两者都在返回值不是 null、false、undefined 时停。
+ * waterfall 把最后一个参数当成最内层 next。监听器从外向内包住它。不调用 next() 就截断后面的人和内层实现。
+ * next() 只能调用一次。
+ * on() 把监听登记成当前 fiber 的 effect，fiber 卸载时自动移除。
+ * _resolve 会按 Context.filter 丢掉不属于这个 isolate 的监听。
+ * 详见 docs/learn/cordis-from-zero.html#events
+ */
+
 /**
  * Event bus installed as `ctx.events` and mixed into every context.
  *

@@ -3,6 +3,16 @@ import { Context } from './context.ts'
 import { locate } from './reflect.ts'
 import { createCallable, joinPrototype, symbols, type Tracker } from './utils.ts'
 
+/*
+ * 学习：Service 是“把自己登记成 ctx 上一个名字”的基类。
+ * super(ctx, 'counter') 最终调用 ctx.reflect.provide('counter', this)。
+ * 名字默认还可以来自静态 provide。带 [Service.invoke] 的服务会被包成可调用对象，
+ * 所以才能写 ctx.logger('name')。
+ * [symbols.filter] 用 isolate 标签决定这个实例听不听某个上下文的事件。
+ * resolveIntercept 的合并顺序：先放当前 fiber 注入时带的配置，再从根到近处叠祖先 intercept。
+ * 详见 docs/learn/cordis-from-zero.html#scope
+ */
+
 /**
  * Base class for services that expose a named API on `ctx`.
  *

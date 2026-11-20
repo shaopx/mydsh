@@ -166,6 +166,17 @@ function emitPluginDisposed(context: Context, fiber: Fiber) {
   }
 }
 
+/*
+ * 学习：Fiber 是一次插件运行，不是插件类本身。
+ * 状态不要到处手写。_getState() 由三件事推导：uid 空了就是 DISPOSED，有 _error 就是 FAILED，
+ * epoch 不是 __INACTIVE__ 就是 ACTIVE，否则是 PENDING。LOADING 和 UNLOADING 只在过渡时由 _updateState 显式返回。
+ * epoch 字符串 = revision + 每个 inject 实现的 uid。缺任何一个依赖，epoch 就是 __INACTIVE__。
+ * 从 INACTIVE 变成具体字符串就 _reload；变回去或换成另一组依赖就 _unload。
+ * FAILED 不会因为依赖后来到齐而自动重试，必须 update() 清掉 _error。
+ * 提供者要等 dependents 全部卸完才拆自己的 effect，所以使用者卸载期间仍能读到服务。
+ * 详见 docs/learn/cordis-from-zero.html#states
+ */
+
 /**
  * Lifecycle state for one plugin fiber.
  *
